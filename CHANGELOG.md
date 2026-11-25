@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.0-arm64 — 2026-11-24
+
+The first tagged release of the Linux ARM64 / Vulkan port, verified on a
+Snapdragon 8 Gen 3 tablet running Mesa Freedreno / Turnip. See
+[docs/release-notes/v1.0.0-arm64.md](docs/release-notes/v1.0.0-arm64.md) for the
+measurements, the formats the driver reports, and what was not verified.
+
+### Added
+
+- **Native AArch64 runner** built from your own disc by `build_game.sh` /
+  `tools/build-arm64-game.sh`, and a ROM-free distributable from
+  `tools/build-arm64.sh`.
+- **Snapdragon + Freedreno tuning**: Adreno depth-format selection,
+  1×–8× internal scale, MSAA validated against driver support, frustum-widened
+  widescreen, persistent SPIR-V disk cache.
+
+### Verified
+
+- 60 FPS at the default profile and at 2560×1440 / 2× MSAA / 16:9.
+- 83 Python tests OK, 50/50 CTest, `public_export.py verify` passing.
+
 ## Unreleased
 
 ### Fixed
