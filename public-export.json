@@ -5,6 +5,7 @@
   "include": [
     ".github/ISSUE_TEMPLATE.md",
     ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/workflows/build-arm64.yml",
     ".github/workflows/public-ci.yml",
     ".github/workflows/sign-launchers.yml",
     ".gitmodules",
@@ -17,11 +18,14 @@
     "LICENSE",
     "NOTICE",
     "README.md",
+    "assets/icon/icon.png",
+    "assets/projecttenshin-banner.jpg",
     "build_game.sh",
     "build_steamdeck.sh",
     "install_deps.sh",
     "launcher.sh",
     "run_game.sh",
+    "run_arm64_vulkan.sh",
     "CHANGELOG.md",
     "public-export.json",
     "docs/agents/domain.md",
@@ -39,12 +43,21 @@
     "docs/free-camera.md",
     "docs/history.md",
     "docs/matchmaking.md",
+    "docs/release-notes/**",
     "docs/runtime-options.md",
+    "docs/snapdragon-freedreno.md",
     "docs/signpath-artifact-configuration.xml",
     "docs/test-release.md",
+    "platform/arm64/freedreno_vulkan_test.cpp",
+    "platform/arm64/tenshin_vk_probe.cpp",
+    "platform/arm64/thread_affinity.h",
+    "platform/arm64/vulkan_freedreno.h",
     "private/README.md",
     "recomp-runtime/**",
     "third_party/smaa",
+    "tools/build-arm64-game.sh",
+    "tools/build-arm64.sh",
+    "tools/build-host-test.sh",
     "tools/build_game.py",
     "tools/doa3_abi.py",
     "tools/test_doa3_abi.py",
@@ -192,8 +205,18 @@
     },
     {
       "path": "tools/launcher-background.png",
-      "sha256": "2df2429f1b9d3c7607dcf8d9ec1aefadf379f1baad06abd64d3eee8d8447b38b",
-      "reason": "The same backdrop at 640x400 for the SDL launcher, which loads PNG but not JPEG. Update the hash with the file."
+      "sha256": "314263c6cd358f70c71ff7a03efad4906628ad47405b2d1eb4975724e9f0c8c2",
+      "reason": "The same backdrop at 1280x800 for the SDL launcher, which loads PNG but not JPEG. Update the hash with the file."
+    },
+    {
+      "path": "assets/projecttenshin-banner.jpg",
+      "sha256": "897ee80c6e5fcf10e8b6c23a0608e3956aec91609fff75a42a1d3e92bc7c3c67",
+      "reason": "The README's arm64/Vulkan banner: a composite illustration of the game's characters and a handheld running this port, made for the project. Artwork, not an extracted disc asset: no disc bytes, texture pages or filenames. Update the hash with the file."
+    },
+    {
+      "path": "assets/icon/icon.png",
+      "sha256": "0a9eb482d72f8356757829c9b03896cbeb2b9da4cd45890d2c9fddcf2720c66d",
+      "reason": "The project icon at 1024x1024: project artwork depicting the game's characters, matching the banner. Artwork, not an extracted disc asset. Update the hash with the file."
     }
   ]
 }

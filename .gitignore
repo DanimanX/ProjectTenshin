@@ -64,6 +64,8 @@ extern/
 dist/
 tmp/
 *.zip
+*.7z
+*.rar
 *.log
 log.txt
 start-log.txt
