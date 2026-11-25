@@ -1,0 +1,1218 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(doa3_recomp_runtime C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Official SDL3 VC or MinGW build for the Windows input host; SDL3.dll is
+# copied beside each target that uses it.
+if(WIN32)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    include(FetchContent)
+    if(MSVC)
+        FetchContent_Declare(SDL3
+            URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-devel-3.4.16-VC.zip
+            URL_HASH SHA256=1a784cb2a5c64d56fe7a62090fe9d242d9865f235e4ea9678f1a6ba4e693e7de)
+    else()
+        FetchContent_Declare(SDL3
+            URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-devel-3.4.16-mingw.zip
+            URL_HASH SHA256=9828bb735cf8a007bcf0ac5aa9f01f3fcb54b7ca67c932e775c905c5d5053a60)
+    endif()
+    FetchContent_MakeAvailable(SDL3)
+    find_package(SDL3 3.4 CONFIG REQUIRED PATHS "${sdl3_SOURCE_DIR}/cmake" NO_DEFAULT_PATH)
+    function(recomp_use_sdl3 target)
+        target_link_libraries(${target} PRIVATE SDL3::SDL3)
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E
+            copy_if_different "$<TARGET_FILE:SDL3::SDL3>" "$<TARGET_FILE_DIR:${target}>")
+    endfunction()
+    # The SDL_GPU presenter compiles its shaders with shaderc at run time.
+    # LWJGL's build of shaderc 2c8cae7 is one DLL that imports only KERNEL32.
+    set(RECOMP_SHADERC_DLL "${CMAKE_BINARY_DIR}/_deps/shaderc/windows/x64/org/lwjgl/shaderc/shaderc.dll")
+    if(NOT EXISTS "${RECOMP_SHADERC_DLL}")
+        set(_shaderc_jar "${CMAKE_BINARY_DIR}/_deps/lwjgl-shaderc-3.4.3-natives-windows.jar")
+        file(DOWNLOAD
+            https://repo1.maven.org/maven2/org/lwjgl/lwjgl-shaderc/3.4.3/lwjgl-shaderc-3.4.3-natives-windows.jar
+            "${_shaderc_jar}"
+            EXPECTED_HASH SHA256=e8e631d007b36edf1440cb4d42654a9b5c03bcb91b9c333c6a81ec6a3911f8bc)
+        file(ARCHIVE_EXTRACT INPUT "${_shaderc_jar}" DESTINATION "${CMAKE_BINARY_DIR}/_deps/shaderc"
+            PATTERNS windows/x64/org/lwjgl/shaderc/shaderc.dll)
+        if(NOT EXISTS "${RECOMP_SHADERC_DLL}")
+            message(FATAL_ERROR "${_shaderc_jar} holds no shaderc.dll")
+        endif()
+    endif()
+    function(recomp_use_shaderc target)
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND "${CMAKE_COMMAND}" -E
+            copy_if_different "${RECOMP_SHADERC_DLL}" "$<TARGET_FILE_DIR:${target}>")
+    endfunction()
+else()
+    # macOS builds need SDL3 (brew install sdl3). Linux uses the system SDL3,
+    # or builds it when RECOMP_FETCH_SDL3 is on, as build_game.py asks (Ubuntu
+    # 24.04 has no package). Hosts with neither only configure, which the
+    # tools tests do without it.
+    option(RECOMP_FETCH_SDL3 "Build SDL3 when the system has none" OFF)
+    find_package(SDL3 QUIET)
+    if(APPLE AND NOT SDL3_FOUND)
+        message(FATAL_ERROR "SDL3 is required: brew install sdl3")
+    endif()
+    if(NOT SDL3_FOUND AND RECOMP_FETCH_SDL3)
+        if(POLICY CMP0135)
+            cmake_policy(SET CMP0135 NEW)
+        endif()
+        include(FetchContent)
+        # The release the Steam Deck build was tested with, pinned like the Windows zip.
+        FetchContent_Declare(SDL3
+            URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.12/SDL3-3.4.12.tar.gz
+            URL_HASH SHA256=f07b958a9ac5020fb7a44cadb957f658b2149c3c8abb4f63145fac9303249db7)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_SHARED ON CACHE BOOL "" FORCE)
+        set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(SDL3)
+        set(SDL3_FOUND TRUE)
+    endif()
+    function(recomp_use_sdl3 target)
+        if(SDL3_FOUND)
+            target_link_libraries(${target} PRIVATE SDL3::SDL3)
+        endif()
+    endfunction()
+endif()
+
+# Dear ImGui draws the runtime's overlay text (the swimsuit switch's names
+# and the free camera's panel)
+# over the game through the presenter (D3D11 on Windows, SDL GPU elsewhere);
+# see overlay_*.cpp. Set FETCHCONTENT_SOURCE_DIR_IMGUI to configure offline.
+if(WIN32 OR SDL3_FOUND)
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    include(FetchContent)
+    FetchContent_Declare(imgui
+        URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9.tar.gz
+        URL_HASH SHA256=3872a5f90df78fced023c1945f4466b654fd74573370b77b17742149763a7a7c)
+    FetchContent_MakeAvailable(imgui)
+    add_library(recomp_imgui STATIC
+        "${imgui_SOURCE_DIR}/imgui.cpp"
+        "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+        "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+        "${imgui_SOURCE_DIR}/imgui_widgets.cpp")
+    target_include_directories(recomp_imgui PUBLIC "${imgui_SOURCE_DIR}")
+    target_sources(recomp_imgui PRIVATE "${imgui_SOURCE_DIR}/backends/imgui_impl_sdlgpu3.cpp")
+    recomp_use_sdl3(recomp_imgui)
+    if(WIN32)
+        # Windows has both presenters: Direct3D 11 and SDL_GPU on Vulkan.
+        target_sources(recomp_imgui PRIVATE "${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
+        target_link_libraries(recomp_imgui PUBLIC d3d11 d3dcompiler)
+    endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Threads REQUIRED)
+    add_compile_definitions(_GNU_SOURCE)
+    # glibc keeps libm separate; macOS links it with libSystem.
+    link_libraries(Threads::Threads ${CMAKE_DL_LIBS} m)
+endif()
+
+# Clang contracts a*b+c into FMA by default on AArch64. Keep IEEE operation
+# order so guest float results match the x86 hosts and the Windows build.
+# Generated code reads the same guest bytes as float and integer and relies on
+# 32-bit wraparound, so GCC and Clang must not optimize on strict aliasing or
+# signed overflow; MSVC does neither.
+if(NOT MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fno-strict-aliasing>
+        $<$<COMPILE_LANGUAGE:C,CXX>:-fwrapv>)
+endif()
+# The guest sprintf adapter needs C99 printf, which a MinGW on msvcrt.dll
+# lacks. llvm-mingw targets Windows 7 by default; the port needs Windows 10.
+if(MINGW)
+    add_compile_definitions(__USE_MINGW_ANSI_STDIO=1 _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+    # Link libc++ and libunwind in so the runner needs no toolchain DLLs.
+    add_link_options(-static)
+endif()
+
+if(NOT WIN32)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        set(RECOMP_FIBER_ASM fiber_switch_arm64.S)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+        set(RECOMP_FIBER_ASM fiber_switch_x86_64.S)
+    endif()
+    if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+        set(RECOMP_FIBER_ASM fiber_switch_arm64.S)
+    elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+        set(RECOMP_FIBER_ASM fiber_switch_x86_64.S)
+    endif()
+endif()
+
+# Optional SMAA from the third_party/smaa submodule; without it RECOMP_D3D_SMAA
+# reports unavailable. The shader source is embedded as a byte list.
+set(_smaa_dir "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/smaa")
+if(EXISTS "${_smaa_dir}/SMAA.hlsl")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_smaa_dir}/SMAA.hlsl")
+    file(READ "${_smaa_dir}/SMAA.hlsl" _smaa_hex HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," _smaa_hex "${_smaa_hex}")
+    file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/smaa_hlsl.inc" CONTENT "${_smaa_hex}")
+    # Only the presenter uses SMAA; scoping it keeps generated chunks untouched.
+    set_source_files_properties(d3d_presenter_d3d11.cpp d3d_presenter_d3d11_test.cpp
+        PROPERTIES COMPILE_DEFINITIONS RECOMP_SMAA
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${_smaa_dir}/Textures")
+endif()
+
+set(RECOMP_FUNCTION_SOURCE "" CACHE FILEPATH
+    "Authenticated generated function source to compile")
+set(RECOMP_FUNCTION_SHA256 "" CACHE STRING
+    "SHA-256 from the generated function's authenticated receipt")
+set(RECOMP_BOUNDARY_SOURCE "" CACHE FILEPATH
+    "Optional authenticated generated caller/callee source to compile")
+set(RECOMP_BOUNDARY_SHA256 "" CACHE STRING
+    "SHA-256 of the authenticated generated caller/callee source")
+set(RECOMP_ENTRY_SOURCE "" CACHE FILEPATH
+    "Optional authenticated generated XBE entry source to compile")
+set(RECOMP_ENTRY_SHA256 "" CACHE STRING
+    "SHA-256 of the authenticated generated XBE entry source")
+set(RECOMP_PROGRAM_DIR "" CACHE PATH
+    "Authenticated complete generated-source snapshot")
+set(RECOMP_PROGRAM_MANIFEST_SHA256 "" CACHE STRING
+    "SHA-256 of the authenticated generated-source tree manifest")
+option(RECOMP_DOA3_JP "The lifted XBE is Japan 3.1 (D3D8 4134)" OFF)
+# Europe 3.2 is XDK 4134 too: it takes the Japan bindings at Europe addresses.
+option(RECOMP_DOA3_EUR "The lifted XBE is Europe 3.2 (D3D8 4134)" OFF)
+if(RECOMP_DOA3_EUR)
+    set(RECOMP_DOA3_JP ON)
+    set(RECOMP_PROGRAM_FORWARDS program_forwards_eur.c)
+elseif(RECOMP_DOA3_JP)
+    set(RECOMP_PROGRAM_FORWARDS program_forwards_jp.c)
+else()
+    set(RECOMP_PROGRAM_FORWARDS program_forwards.c)
+endif()
+if((RECOMP_FUNCTION_SOURCE AND NOT RECOMP_FUNCTION_SHA256) OR
+   (RECOMP_FUNCTION_SHA256 AND NOT RECOMP_FUNCTION_SOURCE))
+    message(FATAL_ERROR
+        "RECOMP_FUNCTION_SOURCE and RECOMP_FUNCTION_SHA256 must be supplied together")
+endif()
+if((RECOMP_BOUNDARY_SOURCE AND NOT RECOMP_BOUNDARY_SHA256) OR
+   (RECOMP_BOUNDARY_SHA256 AND NOT RECOMP_BOUNDARY_SOURCE))
+    message(FATAL_ERROR
+        "RECOMP_BOUNDARY_SOURCE and RECOMP_BOUNDARY_SHA256 must be supplied together")
+endif()
+if((RECOMP_ENTRY_SOURCE AND NOT RECOMP_ENTRY_SHA256) OR
+   (RECOMP_ENTRY_SHA256 AND NOT RECOMP_ENTRY_SOURCE))
+    message(FATAL_ERROR
+        "RECOMP_ENTRY_SOURCE and RECOMP_ENTRY_SHA256 must be supplied together")
+endif()
+if((RECOMP_PROGRAM_DIR AND NOT RECOMP_PROGRAM_MANIFEST_SHA256) OR
+   (RECOMP_PROGRAM_MANIFEST_SHA256 AND NOT RECOMP_PROGRAM_DIR))
+    message(FATAL_ERROR
+        "RECOMP_PROGRAM_DIR and RECOMP_PROGRAM_MANIFEST_SHA256 must be supplied together")
+endif()
+
+if(MSVC)
+    set(_recomp_force_include "/FI${CMAKE_CURRENT_SOURCE_DIR}/runtime.h")
+else()
+    set(_recomp_force_include
+        "-include" "${CMAKE_CURRENT_SOURCE_DIR}/runtime.h")
+endif()
+
+set(_recomp_test_leaf_source runtime_public_fixture.c)
+set(_recomp_test_uses_public_fixture TRUE)
+if(RECOMP_FUNCTION_SOURCE)
+    get_filename_component(_recomp_function_source
+        "${RECOMP_FUNCTION_SOURCE}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    if(NOT EXISTS "${_recomp_function_source}")
+        message(FATAL_ERROR "RECOMP_FUNCTION_SOURCE does not exist")
+    endif()
+
+    file(SHA256 "${_recomp_function_source}" _recomp_function_sha256)
+    string(TOLOWER "${RECOMP_FUNCTION_SHA256}" _expected_function_sha256)
+    if(NOT _recomp_function_sha256 STREQUAL _expected_function_sha256)
+        message(FATAL_ERROR
+            "RECOMP_FUNCTION_SOURCE does not match the authenticated receipt")
+    endif()
+
+    set_source_files_properties("${_recomp_function_source}" PROPERTIES
+        COMPILE_DEFINITIONS RECOMP_GENERATED_CODE
+        COMPILE_OPTIONS "${_recomp_force_include}")
+    set(_recomp_test_leaf_source "${_recomp_function_source}")
+    set(_recomp_test_uses_public_fixture FALSE)
+endif()
+
+set(RECOMP_PROGRAM_EBP_EXPECTED 11052 CACHE STRING
+    "Expected generated EBP prologue override count")
+
+add_executable(recomp_runtime_test
+    runtime.c
+    recomp_math.c
+    stop_report.c
+    runtime_test.c
+    xapi_time_adapter_test.cpp
+    device_model.c
+    device_model_test.c
+    d3d_creation_model.c
+    d3d_creation_adapter.c
+    d3d_creation_model_test.c
+    d3d_draw_model.c
+    d3d_draw_adapter.c
+    d3d_draw_model_test.c
+    d3d_frame_model.c
+    d3d_frame_model_test.c
+    d3d_frame_adapter.c
+    d3d_frame_adapter_test.c
+    d3d_miniport_adapter.c
+    d3d_miniport_adapter_test.c
+    d3d_vblank.cpp
+    d3d_presenter_memory.c
+    d3d_presenter_memory_test.c
+    d3d_render_state_model.c
+    d3d_render_state_adapter.c
+    d3d_render_state_model_test.c
+    d3d_texture_model.c
+    d3d_texture_adapter.c
+    d3d_texture_model_test.c
+    d3d_tile_model.c
+    d3d_tile_adapter.c
+    d3d_tile_model_test.c
+    d3d_vertex_shader_model.c
+    d3d_vertex_shader_adapter.c
+    d3d_vertex_shader_model_test.c
+    xbox_adpcm.c
+    dsound_service_model.c
+    dsound_service_adapter.c
+    dsound_service_adapter_test.c
+    dsound_api_adapter.c
+    dsound_api_adapter_test.c
+    dsound_hrtf.c
+    dsound_reverb.c
+    custom_music.cpp
+    soundtrack_adapter.c
+    custom_music_test.cpp
+    movie_color_model.c
+    cri_service_model.c
+    cri_service_model_test.c
+    cri_service_adapter.c
+    cri_service_adapter_test.c
+    cri_adxm_adapter.c
+    crt_format_model.c
+    crt_format_adapter.c
+    crt_format_adapter_test.c
+    crt_string_adapter.c
+    crt_string_adapter_test.c
+    fiber_model.c
+    fiber_adapter.c
+    fiber_adapter_test.c
+    fiber_model_test.c
+    flag_macro_test.c
+    sse_semantics_test.c
+    directory_model.c
+    directory_model_test.c
+    input_model.c
+    input_adapter.c
+    input_model_test.c
+    input_pulse_source.c
+    input_pulse_source_test.c
+    symbolic_link_model.c
+    symbolic_link_model_test.c
+    xapi_clock.cpp
+    xapi_time_adapter.cpp
+    program_manual.c
+    save_adapter.c
+    ohci_model.c
+    ohci_model_test.c
+    apu_model.c
+    apu_model_test.c
+    kernel_interrupt.c
+    kernel_memory.c
+    kernel_memory_test.c
+    kernel_file.c
+    kernel_file_save_test.c
+    save_transaction.cpp
+    kernel_rtl.c
+    kernel_rtl_test.c
+    kernel_crypto.c
+    kernel_crypto_test.c
+    kernel_thread.c
+    native_fiber.c
+    kernel_thread_test.c
+    thread_scheduler_test.c
+    kernel_video.c
+    kernel_video_test.c
+    kernel_ordinals.c
+    "${_recomp_test_leaf_source}")
+target_include_directories(recomp_runtime_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+if(WIN32)
+    # custom_music.cpp and its test load Media Foundation at run time: Windows N
+    # editions and Server without the Media Foundation feature lack it.
+    target_link_libraries(recomp_runtime_test PRIVATE mfuuid ole32)
+    if(MSVC)
+        set(RECOMP_XAUDIO2 xaudio2)
+    else()
+        # MinGW names the XAudio2 2.9 import library after its DLL.
+        set(RECOMP_XAUDIO2 xaudio2_9)
+    endif()
+else()
+    target_sources(recomp_runtime_test PRIVATE win32_compat.c)
+    if(RECOMP_FIBER_ASM)
+        enable_language(ASM)
+        target_sources(recomp_runtime_test PRIVATE ${RECOMP_FIBER_ASM})
+    endif()
+endif()
+target_compile_definitions(recomp_runtime_test PRIVATE
+    RECOMP_D3D_FRAME_ENABLED RECOMP_DSOUND_TEST_CLOCK RECOMP_DOAXBV_BINDINGS)
+
+if(_recomp_test_uses_public_fixture)
+    target_compile_definitions(recomp_runtime_test PRIVATE
+        RECOMP_PUBLIC_LEAF_FIXTURE)
+endif()
+
+if(RECOMP_BOUNDARY_SOURCE)
+    get_filename_component(_recomp_boundary_source
+        "${RECOMP_BOUNDARY_SOURCE}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    if(NOT EXISTS "${_recomp_boundary_source}")
+        message(FATAL_ERROR "RECOMP_BOUNDARY_SOURCE does not exist")
+    endif()
+
+    file(SHA256 "${_recomp_boundary_source}" _recomp_boundary_sha256)
+    string(TOLOWER "${RECOMP_BOUNDARY_SHA256}" _expected_boundary_sha256)
+    if(NOT _recomp_boundary_sha256 STREQUAL _expected_boundary_sha256)
+        message(FATAL_ERROR
+            "RECOMP_BOUNDARY_SOURCE does not match its authenticated SHA-256")
+    endif()
+
+    set_source_files_properties("${_recomp_boundary_source}" PROPERTIES
+        COMPILE_DEFINITIONS RECOMP_GENERATED_CODE
+        COMPILE_OPTIONS "${_recomp_force_include}")
+    add_executable(recomp_runtime_boundary_test
+        runtime.c
+        recomp_math.c
+        xapi_clock.cpp
+        stop_report.c
+        runtime_boundary_test.c
+        ohci_model.c
+        kernel_ordinals.c
+        apu_model.c
+        "${_recomp_boundary_source}")
+    target_include_directories(recomp_runtime_boundary_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
+
+if(RECOMP_ENTRY_SOURCE)
+    get_filename_component(_recomp_entry_source
+        "${RECOMP_ENTRY_SOURCE}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    if(NOT EXISTS "${_recomp_entry_source}")
+        message(FATAL_ERROR "RECOMP_ENTRY_SOURCE does not exist")
+    endif()
+
+    file(SHA256 "${_recomp_entry_source}" _recomp_entry_sha256)
+    string(TOLOWER "${RECOMP_ENTRY_SHA256}" _expected_entry_sha256)
+    if(NOT _recomp_entry_sha256 STREQUAL _expected_entry_sha256)
+        message(FATAL_ERROR
+            "RECOMP_ENTRY_SOURCE does not match its authenticated SHA-256")
+    endif()
+
+    set_source_files_properties("${_recomp_entry_source}" PROPERTIES
+        COMPILE_DEFINITIONS RECOMP_GENERATED_CODE
+        COMPILE_OPTIONS "${_recomp_force_include}")
+    add_executable(recomp_runner
+        runtime.c
+        recomp_math.c
+        stop_report.c
+        runner.cpp
+        runner_imports.c
+        fiber_model.c
+        fiber_adapter.c
+        kernel_ordinals.c
+        kernel_dispatch.c
+        kernel_config.c
+        kernel_debug.c
+        device_model.c
+        ohci_model.c
+        apu_model.c
+        kernel_device.c
+        kernel_interrupt.c
+        kernel_file.c
+        save_transaction.cpp
+        kernel_memory.c
+        kernel_rtl.c
+        kernel_crypto.c
+        kernel_thread.c
+        native_fiber.c
+        kernel_video.c
+        host_diagnostics.cpp
+        directory_model.c
+        symbolic_link_model.c
+        xapi_clock.cpp
+        xapi_time_adapter.cpp
+        "${_recomp_entry_source}"
+        ../xbe/sha.cpp
+        ../xbe/xbe_parser.cpp)
+    target_include_directories(recomp_runner PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../xbe")
+    if(WIN32)
+        target_link_libraries(recomp_runner PRIVATE bcrypt dbghelp)
+    else()
+        target_sources(recomp_runner PRIVATE win32_compat.c)
+        if(RECOMP_FIBER_ASM)
+            enable_language(ASM)
+            target_sources(recomp_runner PRIVATE ${RECOMP_FIBER_ASM})
+        endif()
+        recomp_use_sdl3(recomp_runner)
+    endif()
+endif()
+
+# Netplay's transport, rollback ring, replays, settings and profiles, for the
+# program runner and their tests. The runner adds UPnP (miniupnpc) itself.
+add_library(recomp_netplay STATIC
+    rollback.c
+    replay.c
+    netplay.c
+    netplay_room.c
+    netplay_names.c
+    netplay_settings.cpp
+    netplay_profile.cpp
+    ../xbe/sha.cpp)
+target_include_directories(recomp_netplay PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../xbe")
+# The save sizes a peer's profile is checked against differ by build (doa3_build.h).
+target_compile_definitions(recomp_netplay PUBLIC $<$<BOOL:${RECOMP_DOA3_JP}>:RECOMP_DOA3_JP_BINDINGS>
+    $<$<BOOL:${RECOMP_DOA3_EUR}>:RECOMP_DOA3_EUR_BINDINGS>)
+if(WIN32)
+    target_link_libraries(recomp_netplay PUBLIC ws2_32 bcrypt)
+endif()
+
+if(RECOMP_PROGRAM_DIR)
+    get_filename_component(_recomp_program_dir
+        "${RECOMP_PROGRAM_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+    file(GLOB _recomp_program_names LIST_DIRECTORIES false
+        RELATIVE "${_recomp_program_dir}"
+        "${_recomp_program_dir}/recomp_[0-9][0-9][0-9][0-9].c")
+    list(SORT _recomp_program_names)
+    if(NOT _recomp_program_names)
+        message(FATAL_ERROR "Authenticated program has no source chunks")
+    endif()
+    set(_chunk_index 0)
+    foreach(_name IN LISTS _recomp_program_names)
+        string(REGEX REPLACE "^recomp_0*([0-9]+)\\.c$" "\\1" _number "${_name}")
+        if(NOT _number EQUAL _chunk_index)
+            message(FATAL_ERROR "Authenticated program chunk sequence has a gap: ${_name}")
+        endif()
+        math(EXPR _chunk_index "${_chunk_index} + 1")
+    endforeach()
+    # The manifest authenticates both membership and contents at any chunk count.
+    # Never include the lifter's empty unresolved-stub file; use fail-loud stubs below.
+    list(APPEND _recomp_program_names recomp_dispatch.c recomp_funcs.h)
+    set(_recomp_program_sources)
+    set(_recomp_program_manifest "")
+    foreach(_name IN LISTS _recomp_program_names)
+        set(_path "${_recomp_program_dir}/${_name}")
+        if(NOT EXISTS "${_path}")
+            message(FATAL_ERROR "Authenticated program member is missing: ${_name}")
+        endif()
+        file(SIZE "${_path}" _size)
+        file(SHA256 "${_path}" _sha256)
+        string(APPEND _recomp_program_manifest
+            "${_name}\t${_size}\t${_sha256}\n")
+        if(_name MATCHES "\\.c$")
+            list(APPEND _recomp_program_sources "${_path}")
+        endif()
+    endforeach()
+    string(SHA256 _recomp_program_manifest_sha256
+        "${_recomp_program_manifest}")
+    string(TOLOWER "${RECOMP_PROGRAM_MANIFEST_SHA256}"
+        _expected_program_manifest_sha256)
+    if(NOT _recomp_program_manifest_sha256 STREQUAL
+       _expected_program_manifest_sha256)
+        message(FATAL_ERROR
+            "RECOMP_PROGRAM_DIR does not match its authenticated manifest")
+    endif()
+
+    # The lifter leaves the local EBP of every "push ebp; mov ebp, esp"
+    # prologue undefined. The runtime holds the incoming guest EBP in
+    # g_seh_ebp, which the generated fpo_leaf bodies already read.
+    set(_ebp_before "\n    uint32_t ebp;\n")
+    set(_ebp_after "\n    uint32_t ebp = g_seh_ebp;\n")
+    set(_ebp_growth 12)
+    if(NOT RECOMP_PROGRAM_EBP_EXPECTED MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "RECOMP_PROGRAM_EBP_EXPECTED must be a non-negative integer")
+    endif()
+    set(_ebp_expected "${RECOMP_PROGRAM_EBP_EXPECTED}")
+    set(_ebp_applied 0)
+    set(_recomp_derived_sources)
+    foreach(_source IN LISTS _recomp_program_sources)
+        file(READ "${_source}" _source_text)
+        string(LENGTH "${_source_text}" _length_before)
+        string(REPLACE "${_ebp_before}" "${_ebp_after}"
+            _derived_text "${_source_text}")
+        string(LENGTH "${_derived_text}" _length_after)
+        math(EXPR _applied
+            "(${_length_after} - ${_length_before}) / ${_ebp_growth}")
+        math(EXPR _ebp_applied "${_ebp_applied} + ${_applied}")
+        get_filename_component(_derived_name "${_source}" NAME_WE)
+        set(_derived_source
+            "${CMAKE_CURRENT_BINARY_DIR}/${_derived_name}_ebp.c")
+        file(WRITE "${_derived_source}" "${_derived_text}")
+        if(MSVC AND _derived_name STREQUAL "recomp_0016")
+            # Retain the verified workaround for an MSVC Release optimizer hang.
+            set_property(SOURCE "${_derived_source}" APPEND PROPERTY
+                COMPILE_OPTIONS "$<$<CONFIG:Release>:/Od>")
+        endif()
+        list(APPEND _recomp_derived_sources "${_derived_source}")
+    endforeach()
+    if(NOT _ebp_applied EQUAL _ebp_expected)
+        message(FATAL_ERROR
+            "Authenticated EBP prologue count is ${_ebp_applied}, "
+            "expected ${_ebp_expected}")
+    endif()
+    set(_recomp_program_sources ${_recomp_derived_sources})
+    message(STATUS
+        "Applied ${_ebp_applied} authenticated EBP prologue build overrides")
+    # The lifter also writes its own recomp_types.h beside recomp_funcs.h.
+    # Keep the snapshot directory off the include path and copy the header
+    # beside the derived sources, so generated code includes the runtime's
+    # recomp_types.h.
+    configure_file("${_recomp_program_dir}/recomp_funcs.h"
+        "${CMAKE_CURRENT_BINARY_DIR}/recomp_funcs.h" COPYONLY)
+
+    set(_recomp_program_definitions)
+    foreach(_source IN LISTS _recomp_program_sources)
+        file(READ "${_source}" _source_text)
+        string(REGEX MATCHALL
+            "void[ \t\r\n]+sub_[0-9A-Fa-f]+[ \t\r\n]*\\([ \t\r\n]*void[ \t\r\n]*\\)"
+            _matches "${_source_text}")
+        foreach(_match IN LISTS _matches)
+            string(REGEX MATCH "sub_[0-9A-Fa-f]+" _name "${_match}")
+            list(APPEND _recomp_program_definitions "${_name}")
+        endforeach()
+    endforeach()
+    # Hand-written sub_X definitions: adapters and rebound-address forwards.
+    foreach(_adapter_source program_adapters.c ${RECOMP_PROGRAM_FORWARDS})
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${_adapter_source}"
+            _adapter_text)
+        string(REGEX MATCHALL
+            "void[ \t\r\n]+sub_[0-9A-Fa-f]+[ \t\r\n]*\\([ \t\r\n]*void[ \t\r\n]*\\)"
+            _adapter_matches "${_adapter_text}")
+        foreach(_match IN LISTS _adapter_matches)
+            string(REGEX MATCH "sub_[0-9A-Fa-f]+" _name "${_match}")
+            list(APPEND _recomp_program_definitions "${_name}")
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _recomp_program_definitions)
+
+    set(_recomp_program_references)
+    foreach(_source IN LISTS _recomp_program_sources)
+        file(READ "${_source}" _source_text)
+        # Direct calls name the target as RECOMP_ABI_CALL(va, sub_X).
+        string(REGEX MATCHALL "sub_[0-9A-Fa-f]+[ \t\r\n]*[(),]"
+            _references "${_source_text}")
+        foreach(_reference IN LISTS _references)
+            string(REGEX MATCH "sub_[0-9A-Fa-f]+" _name "${_reference}")
+            list(APPEND _recomp_program_references "${_name}")
+        endforeach()
+    endforeach()
+    # Adapters gated off for this title still name bodies from the title they
+    # were written for; give those fail-loud stubs as well.
+    file(GLOB _recomp_hand_sources
+        "${CMAKE_CURRENT_SOURCE_DIR}/*.c" "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+    list(FILTER _recomp_hand_sources EXCLUDE REGEX "_test\\.(c|cpp)$|runtime_public_fixture\\.c$")
+    foreach(_source IN LISTS _recomp_hand_sources)
+        file(READ "${_source}" _source_text)
+        string(REGEX MATCHALL "sub_[0-9A-Fa-f]+[ \t\r\n]*\\("
+            _references "${_source_text}")
+        foreach(_reference IN LISTS _references)
+            string(REGEX MATCH "sub_[0-9A-Fa-f]+" _name "${_reference}")
+            list(APPEND _recomp_program_references "${_name}")
+        endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _recomp_program_references)
+    set(_missing_source
+        "${CMAKE_CURRENT_BINARY_DIR}/recomp_program_missing.c")
+    file(WRITE "${_missing_source}"
+        "#include <stdint.h>\nvoid recomp_program_missing(uint32_t);\n")
+    set(_missing_count 0)
+    foreach(_name IN LISTS _recomp_program_references)
+        list(FIND _recomp_program_definitions "${_name}" _defined_index)
+        if(_defined_index EQUAL -1)
+            string(SUBSTRING "${_name}" 4 8 _address)
+            file(APPEND "${_missing_source}"
+                "void ${_name}(void) { recomp_program_missing(0x${_address}u); }\n")
+            math(EXPR _missing_count "${_missing_count} + 1")
+        endif()
+    endforeach()
+    message(STATUS
+        "Generated ${_missing_count} fail-loud stubs for absent snapshot bodies")
+
+    # The netplay host forwards its UDP port through the router with UPnP.
+    set(UPNPC_BUILD_SHARED OFF CACHE INTERNAL "")
+    set(UPNPC_BUILD_TESTS OFF CACHE INTERNAL "")
+    set(UPNPC_BUILD_SAMPLE OFF CACHE INTERNAL "")
+    set(UPNPC_NO_INSTALL ON CACHE INTERNAL "")
+    include(FetchContent)
+    FetchContent_Declare(miniupnpc
+        URL https://github.com/miniupnp/miniupnp/archive/refs/tags/miniupnpc_2_3_3.tar.gz
+        URL_HASH SHA256=8cf2c833b3e76fc4893ff29c2a376e3394962449e5970e373c0a91421724d222
+        SOURCE_SUBDIR miniupnpc)
+    FetchContent_MakeAvailable(miniupnpc)
+
+    # Everything but the presenter and its overlay. Windows links these objects
+    # into both runners, so the generated program compiles once.
+    add_library(recomp_program_objects OBJECT
+        doa3_collision_adapter.c
+        runtime.c
+        stop_report.c
+        runner.cpp
+        runner_boot.cpp
+        controller_settings.cpp
+        program_adapters.c
+        guest_heap.c
+        ${RECOMP_PROGRAM_FORWARDS}
+        xapi_clock.cpp
+        xapi_time_adapter.cpp
+        program_manual.c
+        save_adapter.c
+        d3d_creation_model.c
+        d3d_creation_adapter.c
+        d3d_draw_model.c
+        d3d_draw_adapter.c
+        costume_inject.c
+        costume_teams.c
+        suit_recipe.c
+        suit_joints.c
+        suit_hands.c
+        suit_legs.c
+        suit_skirt.c
+        suit_chain.c
+        body_joints.c
+        free_camera.c
+        free_camera_adapter.c
+        menu_quit.c
+        quit_icon.c
+        scene_freeze.c
+        scene_freeze_adapter.c
+        quit_prompt.c
+        screenshot.c
+        overlay_text.c
+        d3d_frame_model.c
+        d3d_frame_adapter.c
+        d3d_miniport_adapter.c
+        d3d_vblank.cpp
+        overlay_imgui_panel.cpp
+        d3d_presenter_capture.cpp
+        d3d_vertex_program.cpp
+        d3d_render_state_model.c
+        d3d_render_state_adapter.c
+        d3d_texture_model.c
+        d3d_texture_adapter.c
+        d3d_tile_model.c
+        d3d_tile_adapter.c
+        d3d_vertex_shader_model.c
+        d3d_vertex_shader_adapter.c
+        xbox_adpcm.c
+        dsound_service_model.c
+        dsound_service_adapter.c
+        dsound_api_adapter.c
+        dsound_hrtf.c
+        dsound_reverb.c
+        cri_adxm_adapter.c
+        $<$<PLATFORM_ID:Windows>:audio_output_xaudio2.cpp>
+        $<$<PLATFORM_ID:Windows>:audio_capture_xapo.cpp>
+        $<$<NOT:$<PLATFORM_ID:Windows>>:audio_output_sdl.cpp>
+        custom_music.cpp
+        soundtrack_adapter.c
+        movie_color_model.c
+        cri_service_model.c
+        cri_service_adapter.c
+        crt_format_model.c
+        crt_format_adapter.c
+        crt_string_adapter.c
+        fiber_model.c
+        fiber_adapter.c
+        directory_model.c
+        input_model.c
+        input_adapter.c
+        input_host_win32.c
+        input_pulse_source.c
+        symbolic_link_model.c
+        kernel_ordinals.c
+        kernel_dispatch.c
+        kernel_config.c
+        kernel_debug.c
+        device_model.c
+        ohci_model.c
+        apu_model.c
+        kernel_device.c
+        kernel_interrupt.c
+        kernel_file.c
+        save_transaction.cpp
+        kernel_memory.c
+        kernel_rtl.c
+        kernel_crypto.c
+        recomp_math.c
+        kernel_thread.c
+        native_fiber.c
+        kernel_video.c
+        host_diagnostics.cpp
+        input_log.c
+        guest_snapshot.c
+        synctest.c
+        synctest_modules.c
+        netplay_upnp.c
+        netplay_session.cpp
+        game_state.c
+        game_storage.cpp
+        netplay_menu.cpp
+        netplay_menu_room.cpp
+        netplay_menu_find.cpp
+        overlay.c
+        perf_overlay.c
+        input_keyboard_win32.c
+        "${_missing_source}"
+        ${_recomp_program_sources}
+        ../xbe/xbe_parser.cpp)
+    target_compile_definitions(recomp_program_objects PUBLIC
+        RECOMP_FULL_PROGRAM
+        RECOMP_D3D_FRAME_ENABLED
+        # Every host computes RCPSS and RSQRTSS alike, as netplay compares
+        # guest state across machines (recomp_types.h).
+        RECOMP_PORTABLE_MATH
+        $<$<BOOL:${RECOMP_DOA3_JP}>:RECOMP_DOA3_JP_BINDINGS>
+        $<$<BOOL:${RECOMP_DOA3_EUR}>:RECOMP_DOA3_EUR_BINDINGS>)
+    target_include_directories(recomp_program_objects PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../xbe")
+    target_link_libraries(recomp_program_objects PUBLIC recomp_imgui recomp_netplay libminiupnpc-static)
+    # The runners link SDL3 and copy its DLL; object libraries take no POST_BUILD.
+    if(TARGET SDL3::SDL3)
+        target_link_libraries(recomp_program_objects PRIVATE SDL3::SDL3)
+    endif()
+    # Netplay pairs runners of one release (VERSION) or commit and one program,
+    # whatever the host; the runner adds the XBE hash at startup.
+    set(RECOMP_NETPLAY_VERSION "" CACHE STRING "Release or commit netplay pairs on; empty reads VERSION or Git")
+    set(_netplay_version "${RECOMP_NETPLAY_VERSION}")
+    if(NOT _netplay_version AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION")
+        file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" _netplay_version LIMIT_COUNT 1)
+    elseif(NOT _netplay_version)
+        execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            OUTPUT_VARIABLE _netplay_version OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        # Configure again when HEAD moves: a checkout rewrites HEAD, a commit its branch's ref and HEAD's log.
+        execute_process(COMMAND git symbolic-ref -q HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            OUTPUT_VARIABLE _git_branch OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(NOT _git_branch)
+            set(_git_branch HEAD)
+        endif()
+        execute_process(COMMAND git rev-parse --git-path HEAD --git-path logs/HEAD --git-path "${_git_branch}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            OUTPUT_VARIABLE _git_head_files OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        string(REPLACE "\n" ";" _git_head_files "${_git_head_files}")
+        foreach(_git_head_file IN LISTS _git_head_files)
+            get_filename_component(_git_head_file "${_git_head_file}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+            if(EXISTS "${_git_head_file}")
+                set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_git_head_file}")
+            endif()
+        endforeach()
+    endif()
+    if(NOT _netplay_version)
+        message(FATAL_ERROR "Netplay needs a VERSION file, a Git checkout or RECOMP_NETPLAY_VERSION")
+    endif()
+    string(SHA256 _netplay_build "${_netplay_version}\n${RECOMP_PROGRAM_MANIFEST_SHA256}\n")
+    message(STATUS "Netplay build ${_netplay_build} (${_netplay_version})")
+    # Only runner.cpp reads it, so a new commit does not recompile the generated program.
+    set_source_files_properties(runner.cpp PROPERTIES COMPILE_DEFINITIONS RECOMP_NETPLAY_BUILD="${_netplay_build}")
+    if(WIN32)
+        target_link_libraries(recomp_program_objects PUBLIC
+            bcrypt dbghelp user32 winmm shell32 ole32 uuid ws2_32 iphlpapi ${RECOMP_XAUDIO2} mfuuid)
+    else()
+        target_sources(recomp_program_objects PRIVATE win32_compat.c)
+        if(RECOMP_FIBER_ASM)
+            enable_language(ASM)
+            target_sources(recomp_program_objects PRIVATE ${RECOMP_FIBER_ASM})
+        endif()
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(recomp_program_objects PUBLIC m)
+    endif()
+
+    # The binary .ico stays out of git; see docs/building.md.
+    set(RECOMP_APP_ICON "" CACHE FILEPATH "Optional .ico embedded as the runner icon")
+    if(RECOMP_APP_ICON)
+        file(TO_CMAKE_PATH "${RECOMP_APP_ICON}" app_icon)
+        file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc"
+            CONTENT "1 ICON \"${app_icon}\"\n")
+    endif()
+    function(recomp_add_program_runner name)
+        add_executable(${name} ${ARGN})
+        target_link_libraries(${name} PRIVATE recomp_program_objects)
+        recomp_use_sdl3(${name})
+        if(RECOMP_APP_ICON)
+            target_sources(${name} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app_icon.rc")
+        endif()
+    endfunction()
+    if(WIN32)
+        recomp_add_program_runner(recomp_program_runner
+            d3d_presenter_d3d11.cpp d3d_presenter_thread.cpp overlay_d3d11.cpp)
+        target_link_libraries(recomp_program_runner PRIVATE d3d11 d3dcompiler dxgi)
+        # The launcher's Renderer setting starts this one instead.
+        recomp_add_program_runner(recomp_program_runner_vulkan
+            d3d_presenter_sdl_gpu.cpp overlay_sdl_gpu.cpp)
+        recomp_use_shaderc(recomp_program_runner_vulkan)
+    else()
+        recomp_add_program_runner(recomp_program_runner
+            d3d_presenter_sdl_gpu.cpp overlay_sdl_gpu.cpp)
+    endif()
+
+    # Settings launcher for launcher.sh. SteamOS has no compiler, so it is built
+    # beside the runner rather than on first use like the macOS launcher.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(recomp_launcher ../tools/launcher_sdl.cpp)
+        recomp_use_sdl3(recomp_launcher)
+    endif()
+endif()
+
+if(WIN32)
+    add_executable(recomp_d3d_presenter_d3d11_test
+        d3d_presenter_d3d11_test.cpp
+        input_keyboard_win32.c
+        d3d_vblank.cpp
+        xapi_clock.cpp
+        d3d_vertex_program.cpp
+        d3d_draw_model.c
+        d3d_texture_model.c
+        overlay_d3d11.cpp
+        overlay_imgui_panel.cpp
+        overlay_text.c
+        screenshot.c)
+    target_link_libraries(recomp_d3d_presenter_d3d11_test PRIVATE
+        d3d11 d3dcompiler dxgi user32 shell32 ole32 uuid recomp_imgui)
+    add_executable(recomp_d3d_presenter_thread_test
+        d3d_presenter_thread_test.cpp
+        d3d_presenter_thread.cpp
+        d3d_presenter_capture.cpp
+        d3d_presenter_d3d11.cpp
+        input_keyboard_win32.c
+        d3d_vblank.cpp
+        xapi_clock.cpp
+        d3d_vertex_program.cpp
+        d3d_draw_model.c
+        d3d_texture_model.c
+        overlay_d3d11.cpp
+        overlay_imgui_panel.cpp
+        overlay_text.c
+        screenshot.c)
+    target_link_libraries(recomp_d3d_presenter_thread_test PRIVATE
+        d3d11 d3dcompiler dxgi user32 shell32 ole32 uuid recomp_imgui)
+    add_executable(recomp_audio_output_xaudio2_test audio_output_xaudio2_test.cpp)
+    add_executable(recomp_audio_capture_xapo_test audio_capture_xapo_test.cpp)
+    target_link_libraries(recomp_audio_capture_xapo_test PRIVATE ole32)
+    add_executable(recomp_input_host_test input_host_win32.c input_host_win32_test.c)
+    target_link_libraries(recomp_input_host_test PRIVATE user32)
+    recomp_use_sdl3(recomp_input_host_test)
+endif()
+add_executable(recomp_d3d_presenter_sdl_gpu_test
+    d3d_presenter_sdl_gpu.cpp
+    d3d_presenter_sdl_gpu_test.cpp
+    input_keyboard_win32.c
+    d3d_vertex_program.cpp
+    d3d_draw_model.c
+    d3d_texture_model.c
+    overlay_sdl_gpu.cpp
+    overlay_imgui_panel.cpp
+    overlay_text.c
+    screenshot.c)
+recomp_use_sdl3(recomp_d3d_presenter_sdl_gpu_test)
+target_link_libraries(recomp_d3d_presenter_sdl_gpu_test PRIVATE recomp_imgui)
+if(WIN32)
+    recomp_use_shaderc(recomp_d3d_presenter_sdl_gpu_test)
+    target_link_libraries(recomp_d3d_presenter_sdl_gpu_test PRIVATE shell32 ole32 uuid)
+endif()
+if(NOT WIN32)
+    add_executable(recomp_audio_output_sdl_test audio_output_sdl.cpp audio_output_sdl_test.cpp)
+    recomp_use_sdl3(recomp_audio_output_sdl_test)
+    add_executable(recomp_input_host_test input_host_win32.c input_host_win32_test.c)
+    recomp_use_sdl3(recomp_input_host_test)
+    add_executable(recomp_win32_compat_test win32_compat.c win32_compat_test.c)
+    add_test(NAME recomp-runtime-win32-compat COMMAND recomp_win32_compat_test)
+endif()
+
+add_executable(recomp_sha_test sha_test.cpp ../xbe/sha.cpp)
+target_include_directories(recomp_sha_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../xbe")
+if(WIN32)
+    target_link_libraries(recomp_sha_test PRIVATE bcrypt)
+endif()
+add_test(NAME recomp-runtime-sha COMMAND recomp_sha_test)
+
+add_executable(recomp_d3d_presenter_capture_test
+    d3d_presenter_capture.cpp d3d_presenter_capture_test.cpp)
+
+add_executable(recomp_save_transaction_test
+    save_transaction.cpp save_transaction_test.cpp)
+
+add_executable(recomp_xbox_adpcm_test xbox_adpcm.c xbox_adpcm_test.c)
+
+add_executable(recomp_dsound_hrtf_test dsound_hrtf.c dsound_hrtf_test.c)
+
+add_executable(recomp_dsound_reverb_test dsound_reverb.c dsound_reverb_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_dsound_reverb_test PRIVATE m)
+endif()
+
+add_executable(recomp_movie_color_test movie_color_model.c movie_color_model_test.c)
+
+if(WIN32 OR SDL3_FOUND)
+    add_executable(recomp_perf_overlay_test perf_overlay.c perf_overlay_test.c)
+    recomp_use_sdl3(recomp_perf_overlay_test)
+endif()
+add_executable(recomp_free_camera_test free_camera.c free_camera_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_free_camera_test PRIVATE m)
+endif()
+add_executable(recomp_costume_teams_test costume_teams.c costume_teams_test.c)
+add_executable(recomp_quit_prompt_test quit_prompt.c quit_prompt_test.c)
+add_executable(recomp_menu_quit_test menu_quit.c quit_icon.c quit_prompt.c d3d_texture_model.c
+    menu_quit_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_menu_quit_test PRIVATE m)
+endif()
+add_executable(recomp_overlay_text_test overlay_text.c overlay_text_test.c)
+add_executable(recomp_scene_freeze_test scene_freeze.c scene_freeze_test.c)
+add_executable(recomp_screenshot_test screenshot.c screenshot_test.c)
+if(WIN32)
+    # screenshot.c asks the shell for the Pictures folder.
+    target_link_libraries(recomp_screenshot_test PRIVATE shell32 ole32 uuid)
+endif()
+
+add_executable(recomp_suit_recipe_test suit_recipe.c suit_joints.c suit_hands.c suit_legs.c suit_skirt.c suit_chain.c body_joints.c suit_recipe_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_suit_recipe_test PRIVATE m)
+endif()
+add_executable(recomp_suit_chain_test suit_chain.c suit_chain_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_suit_chain_test PRIVATE m)
+endif()
+add_executable(recomp_suit_skirt_test suit_skirt.c suit_skirt_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_suit_skirt_test PRIVATE m)
+endif()
+add_executable(recomp_suit_joints_test suit_joints.c body_joints.c suit_joints_test.c)
+if(NOT MSVC)
+    target_link_libraries(recomp_suit_joints_test PRIVATE m)
+endif()
+
+include(CTest)
+if(TARGET recomp_perf_overlay_test)
+    add_test(NAME recomp-runtime-perf-overlay COMMAND recomp_perf_overlay_test)
+endif()
+add_test(NAME recomp-runtime-custom-music COMMAND recomp_runtime_test --custom-music)
+set_tests_properties(recomp-runtime-custom-music PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME recomp-runtime-movie-color COMMAND recomp_movie_color_test)
+add_test(NAME recomp-runtime-suit-recipe COMMAND recomp_suit_recipe_test)
+add_test(NAME recomp-runtime-suit-joints COMMAND recomp_suit_joints_test)
+add_test(NAME recomp-runtime-suit-skirt COMMAND recomp_suit_skirt_test)
+add_test(NAME recomp-runtime-suit-chain COMMAND recomp_suit_chain_test)
+add_test(NAME recomp-runtime-free-camera COMMAND recomp_free_camera_test)
+add_test(NAME recomp-runtime-costume-teams COMMAND recomp_costume_teams_test)
+add_test(NAME recomp-runtime-quit-prompt COMMAND recomp_quit_prompt_test)
+add_test(NAME recomp-runtime-menu-quit COMMAND recomp_menu_quit_test)
+add_test(NAME recomp-runtime-overlay-text COMMAND recomp_overlay_text_test)
+add_test(NAME recomp-runtime-scene-freeze COMMAND recomp_scene_freeze_test)
+add_test(NAME recomp-runtime-screenshot COMMAND recomp_screenshot_test)
+add_test(NAME recomp-runtime-xbox-adpcm COMMAND recomp_xbox_adpcm_test)
+add_test(NAME recomp-runtime-dsound-hrtf COMMAND recomp_dsound_hrtf_test)
+add_test(NAME recomp-runtime-dsound-reverb COMMAND recomp_dsound_reverb_test)
+if(TARGET recomp_audio_output_xaudio2_test)
+    add_test(NAME recomp-runtime-audio-output COMMAND recomp_audio_output_xaudio2_test)
+    add_test(NAME recomp-runtime-audio-capture COMMAND recomp_audio_capture_xapo_test)
+elseif(TARGET recomp_audio_output_sdl_test)
+    add_test(NAME recomp-runtime-audio-output COMMAND recomp_audio_output_sdl_test)
+endif()
+if(TARGET recomp_input_host_test)
+    target_compile_definitions(recomp_input_host_test PRIVATE RECOMP_INPUT_TEST)
+    add_test(NAME recomp-runtime-input-host-sdl COMMAND recomp_input_host_test)
+    add_test(NAME recomp-runtime-input-host-keymap COMMAND recomp_input_host_test keymap)
+    set_tests_properties(recomp-runtime-input-host-keymap PROPERTIES
+        ENVIRONMENT "RECOMP_KEYMAP=a=20,bogus,start=74,x=53,ltrig=31;RECOMP_TEST_FOCUSED=1")
+    add_test(NAME recomp-runtime-input-host-alt-enter COMMAND recomp_input_host_test alt-enter)
+    set_tests_properties(recomp-runtime-input-host-alt-enter PROPERTIES ENVIRONMENT "RECOMP_TEST_FOCUSED=1")
+    add_test(NAME recomp-runtime-input-host-keyboard-menu COMMAND recomp_input_host_test keyboard-menu)
+    set_tests_properties(recomp-runtime-input-host-keyboard-menu PROPERTIES ENVIRONMENT "RECOMP_TEST_FOCUSED=1")
+endif()
+if(TARGET recomp_d3d_presenter_sdl_gpu_test)
+    add_test(NAME recomp-runtime-d3d-presenter COMMAND recomp_d3d_presenter_sdl_gpu_test)
+    set_tests_properties(recomp-runtime-d3d-presenter PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+add_test(NAME recomp-runtime-save-transaction COMMAND recomp_save_transaction_test)
+add_test(NAME recomp-runtime-d3d-presenter-capture COMMAND recomp_d3d_presenter_capture_test)
+add_test(NAME recomp-runtime-thread-scheduler COMMAND recomp_runtime_test --thread-scheduler)
+add_test(NAME recomp-runtime-four-cases COMMAND recomp_runtime_test)
+foreach(draw_case IN ITEMS draw up)
+    add_test(NAME recomp-runtime-presenter-close-${draw_case}
+        COMMAND recomp_runtime_test --presenter-close-${draw_case})
+    set_tests_properties(recomp-runtime-presenter-close-${draw_case} PROPERTIES
+        PASS_REGULAR_EXPRESSION "host-window-close.*kind=normal-exit.*exit_code=0")
+endforeach()
+add_test(NAME recomp-runtime-presenter-close-release
+    COMMAND recomp_runtime_test --presenter-close-release)
+set_tests_properties(recomp-runtime-presenter-close-release PROPERTIES
+    PASS_REGULAR_EXPRESSION "host-window-close.*kind=normal-exit.*exit_code=0")
+add_test(
+    NAME recomp-runtime-fiber-stack-recycling
+    COMMAND recomp_runtime_test --fiber-stack-recycling)
+set(_invalid_access_check
+    "${CMAKE_CURRENT_BINARY_DIR}/check-invalid-access-$<CONFIG>.cmake")
+file(GENERATE OUTPUT "${_invalid_access_check}" CONTENT [=[
+execute_process(
+    COMMAND "$<TARGET_FILE:recomp_runtime_test>" --invalid-access
+    RESULT_VARIABLE result
+    ERROR_VARIABLE error)
+string(STRIP "${error}" error)
+if(NOT result EQUAL 2)
+    message(FATAL_ERROR "invalid access exited ${result}, expected 2")
+endif()
+if(NOT error MATCHES
+        "^recomp runtime: undeclared 4-byte guest memory access at 0xffffffff")
+    message(FATAL_ERROR "unexpected invalid-access diagnostic: ${error}")
+endif()
+foreach(mode IN ITEMS --ram-overrun --ram-pending-ohci)
+    execute_process(
+        COMMAND "$<TARGET_FILE:recomp_runtime_test>" "${mode}"
+        RESULT_VARIABLE result ERROR_VARIABLE error)
+    if(mode STREQUAL "--ram-overrun")
+        set(expected "^recomp runtime: undeclared 4-byte guest memory access at 0x83ffffff")
+    else()
+        set(expected "^recomp runtime: unsupported OHCI write 0xffffffff at 0xfed00004")
+    endif()
+    if(NOT result EQUAL 2 OR NOT error MATCHES "${expected}")
+        message(FATAL_ERROR "${mode}: exit=${result}, diagnostic=${error}")
+    endif()
+endforeach()
+]=])
+add_test(NAME recomp-runtime-invalid-access
+    COMMAND "${CMAKE_COMMAND}" -P "${_invalid_access_check}")
+if(TARGET recomp_runtime_boundary_test)
+    add_test(NAME recomp-runtime-caller-callee-integration
+        COMMAND recomp_runtime_boundary_test)
+endif()
+if(TARGET recomp_d3d_presenter_d3d11_test)
+    add_test(NAME recomp-runtime-d3d11-texture-cache
+        COMMAND recomp_d3d_presenter_d3d11_test)
+    add_test(NAME recomp-runtime-d3d-presenter-thread
+        COMMAND recomp_d3d_presenter_thread_test)
+endif()
+
+if(MSVC)
+    add_executable(recomp_stop_report_test
+        stop_report_test.cpp stop_report.c host_diagnostics.cpp)
+    target_link_libraries(recomp_stop_report_test PRIVATE dbghelp)
+    set(_stop_report_check
+        "${CMAKE_CURRENT_BINARY_DIR}/check-stop-report-$<CONFIG>.cmake")
+    file(GENERATE OUTPUT "${_stop_report_check}" CONTENT [=[
+foreach(mode IN ITEMS normal mismatch expected-error error boundary handled crash)
+    set(log "${CMAKE_CURRENT_LIST_DIR}/stop-report-${mode}.log")
+    file(REMOVE "${log}")
+    execute_process(COMMAND "$<TARGET_FILE:recomp_stop_report_test>" "${mode}" "${log}"
+        RESULT_VARIABLE result ERROR_VARIABLE error TIMEOUT 10)
+    if(mode STREQUAL "crash")
+        if(result STREQUAL "0" OR NOT error MATCHES "event=host-crash kind=unhandled-exception"
+                OR error MATCHES "event=runtime-stop" OR EXISTS "${log}")
+            message(FATAL_ERROR "${mode}: exit=${result}, diagnostic=${error}")
+        endif()
+        continue()
+    endif()
+    set(expected_code 0)
+    set(fallback_code 0)
+    set(kind "normal-exit")
+    set(expectation "unchecked")
+    if(mode STREQUAL "mismatch")
+        set(expected_code 3)
+        set(expectation "mismatch")
+    elseif(mode STREQUAL "expected-error" OR mode STREQUAL "error")
+        set(fallback_code 2)
+        set(kind "runtime-error")
+        if(mode STREQUAL "expected-error")
+            set(expectation "match")
+        else()
+            set(expected_code 2)
+        endif()
+    elseif(mode STREQUAL "boundary")
+        set(kind "diagnostic-boundary")
+    endif()
+    if(NOT result STREQUAL "${expected_code}" OR error MATCHES "event=host-crash")
+        message(FATAL_ERROR "${mode}: exit=${result}, diagnostic=${error}")
+    endif()
+    file(READ "${log}" milestone)
+    foreach(output IN ITEMS "${error}" "${milestone}")
+        foreach(field IN ITEMS "event=runtime-stop" "kind=${kind}"
+                "fallback_code=${fallback_code}" "exit_code=${expected_code}" "result=${expectation}")
+            if(NOT output MATCHES "${field}")
+                message(FATAL_ERROR "${mode}: missing ${field} in ${output}")
+            endif()
+        endforeach()
+    endforeach()
+    if(mode STREQUAL "handled" AND "$<CONFIG>" STREQUAL "Debug"
+            AND NOT error MATCHES "event=exception-observed terminal=unknown")
+        message(FATAL_ERROR "handled exception observation missing: ${error}")
+    endif()
+endforeach()
+]=])
+    add_test(NAME recomp-runtime-stop-report
+        COMMAND "${CMAKE_COMMAND}" -P "${_stop_report_check}")
+endif()
+
+add_executable(recomp_controller_settings_test controller_settings.cpp controller_settings_test.cpp)
+add_test(NAME recomp-runtime-controller-settings COMMAND recomp_controller_settings_test)
+
+add_executable(recomp_guest_heap_test guest_heap.c guest_heap_test.c)
+add_test(NAME recomp-runtime-guest-heap COMMAND recomp_guest_heap_test)
+
+add_executable(recomp_d3d_vblank_test d3d_vblank.cpp xapi_clock.cpp d3d_vblank_test.cpp)
+add_test(NAME recomp-runtime-d3d-vblank COMMAND recomp_d3d_vblank_test)
+add_test(NAME recomp-runtime-unpaced COMMAND "${CMAKE_COMMAND}" -E env
+    RECOMP_UNPACED=1 "$<TARGET_FILE:recomp_d3d_vblank_test>")
+
+add_executable(recomp_doa3_collision_test doa3_collision_test.c doa3_collision_adapter.c)
+add_test(NAME recomp-runtime-doa3-collision COMMAND recomp_doa3_collision_test)
+
+add_executable(recomp_math_test recomp_math.c recomp_math_test.c)
+add_test(NAME recomp-runtime-math COMMAND recomp_math_test)
+
+add_executable(recomp_input_log_test input_log.c input_log_test.c)
+add_test(NAME recomp-runtime-input-log COMMAND recomp_input_log_test)
+
+add_executable(recomp_guest_snapshot_test guest_snapshot.c guest_snapshot_test.c)
+add_test(NAME recomp-runtime-guest-snapshot COMMAND recomp_guest_snapshot_test)
+add_executable(recomp_synctest_test synctest.c guest_snapshot.c synctest_test.c)
+target_include_directories(recomp_synctest_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME recomp-runtime-synctest COMMAND recomp_synctest_test)
+add_executable(recomp_rollback_test rollback_test.c)
+target_link_libraries(recomp_rollback_test PRIVATE recomp_netplay)
+add_test(NAME recomp-runtime-rollback COMMAND recomp_rollback_test)
+add_executable(recomp_replay_test replay_test.c)
+target_link_libraries(recomp_replay_test PRIVATE recomp_netplay)
+add_test(NAME recomp-runtime-replay COMMAND recomp_replay_test)
+add_executable(recomp_netplay_test netplay_test.c)
+target_link_libraries(recomp_netplay_test PRIVATE recomp_netplay)
+add_executable(recomp_netplay_lobby_test netplay_lobby_test.cpp)
+target_link_libraries(recomp_netplay_lobby_test PRIVATE recomp_netplay)
+add_test(NAME recomp-runtime-netplay COMMAND recomp_netplay_test)
+add_test(NAME recomp-runtime-netplay-lobby COMMAND recomp_netplay_lobby_test)
+add_executable(recomp_netplay_settings_test netplay_settings_test.cpp)
+target_link_libraries(recomp_netplay_settings_test PRIVATE recomp_netplay)
+add_test(NAME recomp-runtime-netplay-settings COMMAND recomp_netplay_settings_test)
+add_executable(recomp_netplay_profile_test netplay_profile_test.cpp)
+target_link_libraries(recomp_netplay_profile_test PRIVATE recomp_netplay)
+add_test(NAME recomp-runtime-netplay-profile COMMAND recomp_netplay_profile_test)
+
+# ProjectTenshin: Snapdragon big.LITTLE & Freedreno/Turnip Vulkan tests + probe
+add_executable(recomp_freedreno_vulkan_test ../platform/arm64/freedreno_vulkan_test.cpp)
+target_include_directories(recomp_freedreno_vulkan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform/arm64")
+add_test(NAME projecttenshin-freedreno-vulkan COMMAND recomp_freedreno_vulkan_test)
+if(SDL3_FOUND)
+    add_executable(tenshin_vk_probe ../platform/arm64/tenshin_vk_probe.cpp)
+    target_include_directories(tenshin_vk_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform/arm64")
+    recomp_use_sdl3(tenshin_vk_probe)
+endif()

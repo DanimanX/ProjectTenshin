@@ -1,0 +1,4313 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "d3d_presenter.h"
+#include "input_keyboard_win32.h"
+#include "overlay_sdl_gpu.h"
+#include "screenshot.h"
+#include "d3d_draw_model.h"
+#include "d3d_texture_model.h"
+#include "d3d_vertex_program.h"
+#include "widescreen.h"
+#include "../platform/arm64/vulkan_freedreno.h"
+
+#include <SDL3/SDL.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+namespace {
+
+constexpr uint32_t kTextureSlots = 4096u;
+constexpr uint32_t kPaletteBytes = 256u * 4u;
+constexpr uint64_t kTargetByteLimit = 64u * 1024u * 1024u;
+constexpr uint32_t kInitialVertexCapacity = 32u * 1024u * 1024u; // 32 MB
+constexpr uint32_t kInitialIndexCapacity = 16u * 1024u * 1024u;  // 16 MB
+// TransformUniforms in floats: the header every draw pushes, then the
+// fixed-function lighting block. SDL's Vulkan backend binds 4 KB per uniform
+// slot, so vertex program constants live in their own slot.
+constexpr uint32_t kHeaderUniformFloats = 248u;  // water block, then fog_params, fog_color, texcoord_clamp
+constexpr uint32_t kLightingUniformFloats = kHeaderUniformFloats;
+constexpr uint32_t kTransformUniformFloats = 580u;
+constexpr uint32_t kProgramConstantFloats = 192u * 4u;
+constexpr uint32_t kNoProgramConstants = UINT32_MAX;
+
+constexpr uint32_t kBootDrawFvfs[] = {
+    0x042u, 0x044u, 0x102u, 0x104u, 0x112u, 0x116u, 0x118u, 0x11Au,
+    0x142u, 0x144u, 0x212u, 0x216u, 0x21Au, 0x242u, 0x244u, 0x404u
+};
+
+constexpr char kMslShaderPrologue[] = R"(#include <metal_stdlib>
+using namespace metal;
+
+struct TransformUniforms {
+    float4x4 wvp[4];
+    float4 draw_flags;
+    float4 blend_flags;
+    float4 texture_factor;
+    float4 lighting_flags;
+    float4 texture_flags;
+    float4x4 reflection_world_view;
+    float4x4 reflection_normal;
+    float4x4 reflection_transform;
+    float4 reflection_diffuse;
+    float4 reflection_flags;
+    float4 directional_flags;
+    float4 light_stage;
+    float4x4 water_world;
+    float4 water_eye;
+    float4 water_sun;
+    float4 water_sky;
+    float4x4 water_view_proj;
+    float4x4 water_inv_view_proj;
+    float4x4 water_view;
+    float4 water_flow;
+    float4 water_scene;
+    float4 water_sun_color;
+    float4 fog_params;
+    float4 fog_color;
+    float4 texcoord_clamp;
+    float4x4 directional_normals[4];
+    float4 directional_base;
+    float4 directional_material;
+    float4 directional_directions[8];
+    float4 directional_colors[8];
+    float4x4 light_world[4];
+    float4 light_positions[8];
+    float4 light_attenuation[8];
+    float4 light_ambient[8];
+    float4 light_specular[8];
+    float4 light_view;
+};
+
+struct ProgramConstants {
+    float4 vc[192];
+};
+
+// Modern water, as in the D3D11 presenter: eight sharp-crested travelling waves advected by a current
+// (slope, crest height and the variance of waves too fine for the pixel), Dave Hoskins' tileable
+// caustic, and a reflected ray marched through the scene depth.
+float4 water_surface(float2 p, float t, float footprint, float2 flow, float k, float a) {
+    float2 g = float2(0.0);
+    float h = 0.0, variance = 0.0, a0 = a;
+    bool current = dot(flow, flow) > 0.0;
+    float base = current ? atan2(flow.y, flow.x) : 0.0, spread = current ? 0.9 : 3.14159;
+    for (int i = 0; i < 8; ++i) {
+        float angle = base + spread * sin(2.39996 * float(i) + 0.4);
+        float2 d = float2(cos(angle), sin(angle));
+        float fade = saturate(1.5 - k * footprint);
+        float x = k * dot(d, p - flow * t) + 0.8 * sqrt(k) * t;
+        float s = exp(sin(x) - 1.0);
+        h += a * s * fade;
+        g += (a * k * s * cos(x) * fade) * d;
+        variance += 0.25 * a * a * k * k * (1.0 - fade * fade);
+        k *= 1.31; a *= 0.72;
+    }
+    return float4(g, h / (3.6 * a0), variance);
+}
+float water_caustic(float2 xz, float t) {
+    float2 p = fract(xz * 0.3) * 6.28318 - 250.0, i = p;
+    float c = 1.0;
+    for (int n = 0; n < 4; ++n) {
+        float tt = t * (1.0 - 3.5 / float(n + 1));
+        i = p + float2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+        c += 1.0 / length(float2(p.x / (sin(i.x + tt) / 0.005), p.y / (cos(i.y + tt) / 0.005)));
+    }
+    c = 1.17 - pow(c / 4.0, 1.4);
+    return saturate(pow(abs(c), 8.0));
+}
+float water_depth_at(float2 uv, constant TransformUniforms &u, depth2d<float> depth) {
+    int2 size = int2(round(1.0 / u.water_flow.zw));
+    return depth.read(uint2(clamp(int2(uv * float2(size)), int2(0), size - 1)));
+}
+float3 water_world_at(float2 uv, float d, constant TransformUniforms &u) {
+    float4 w = u.water_inv_view_proj * float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    return w.xyz / w.w;
+}
+float2 water_project(float3 p, thread float &z, constant TransformUniforms &u) {
+    float4 c = u.water_view_proj * float4(p, 1.0);
+    z = c.w > 0.0 ? c.z / c.w : -1.0;
+    return float2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+}
+float3 water_trace(float3 p, float3 r, float2 pixel, thread float &hit, constant TransformUniforms &u,
+                   texture2d<float> color, sampler color_sampler, depth2d<float> depth) {
+    hit = 0.0;
+    float stride = 0.06, travelled = stride * fract(52.9829 * fract(dot(pixel, float2(0.06711, 0.00584))));
+    float3 last = p;
+    for (int i = 0; i < 24; ++i) {
+        float3 q = p + r * travelled;
+        float z; float2 uv = water_project(q, z, u);
+        if (any(uv < 0.0) || any(uv > 1.0) || z < 0.0 || z > 1.0) break;
+        float scene = water_depth_at(uv, u, depth);
+        float3 seen = water_world_at(uv, scene, u);
+        // The scene depth holds the bed under the water; a hit there is not a reflection.
+        if (z > scene && seen.y > p.y - 0.02 && distance(seen, q) < 2.0 * stride + 0.05) {
+            float3 a = last, b = q;
+            for (int j = 0; j < 4; ++j) {
+                float3 m = 0.5 * (a + b); float mz; float2 muv = water_project(m, mz, u);
+                if (mz > water_depth_at(muv, u, depth)) b = m; else a = m;
+            }
+            uv = water_project(b, z, u);
+            float2 edge = saturate((0.5 - abs(uv - 0.5)) * 12.0);
+            hit = edge.x * edge.y;
+            return color.sample(color_sampler, uv, level(0.0)).rgb;
+        }
+        last = q; travelled += stride; stride *= 1.25;
+    }
+    return float3(0.0);
+}
+)";
+
+struct TextureEntry {
+    bool used = false;
+    uint32_t data = 0;
+    uint32_t format_byte = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mip_levels = 0;
+    uint8_t palette[kPaletteBytes]{};
+    uint64_t fingerprint = 0;
+    SDL_GPUTexture *texture = nullptr;
+};
+
+struct RenderTargetEntry {
+    RecompD3dTextureDesc desc{};
+    SDL_GPUTexture *texture = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+struct DepthTargetEntry {
+    RecompD3dTextureDesc desc{};
+    SDL_GPUTexture *texture = nullptr;
+    uint64_t bytes = 0;      // charged to the offscreen budget
+    bool host_main = false;  // created at the scaled/MSAA main target size
+};
+
+SDL_GPUBlendFactor hostBlendFactor(RecompD3dBlendFactor factor, bool alpha_channel)
+{
+    switch (factor) {
+    case RECOMP_D3D_BLEND_ZERO: return SDL_GPU_BLENDFACTOR_ZERO;
+    case RECOMP_D3D_BLEND_ONE: return SDL_GPU_BLENDFACTOR_ONE;
+    case RECOMP_D3D_BLEND_SRC_COLOR:
+        return alpha_channel ? SDL_GPU_BLENDFACTOR_SRC_ALPHA : SDL_GPU_BLENDFACTOR_SRC_COLOR;
+    case RECOMP_D3D_BLEND_INV_SRC_COLOR:
+        return alpha_channel ? SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA : SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_COLOR;
+    case RECOMP_D3D_BLEND_SRC_ALPHA: return SDL_GPU_BLENDFACTOR_SRC_ALPHA;
+    case RECOMP_D3D_BLEND_INV_SRC_ALPHA: return SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+    case RECOMP_D3D_BLEND_DST_ALPHA: return SDL_GPU_BLENDFACTOR_DST_ALPHA;
+    case RECOMP_D3D_BLEND_INV_DST_ALPHA: return SDL_GPU_BLENDFACTOR_ONE_MINUS_DST_ALPHA;
+    case RECOMP_D3D_BLEND_DST_COLOR:
+        return alpha_channel ? SDL_GPU_BLENDFACTOR_DST_ALPHA : SDL_GPU_BLENDFACTOR_DST_COLOR;
+    case RECOMP_D3D_BLEND_INV_DST_COLOR:
+        return alpha_channel ? SDL_GPU_BLENDFACTOR_ONE_MINUS_DST_ALPHA : SDL_GPU_BLENDFACTOR_ONE_MINUS_DST_COLOR;
+    case RECOMP_D3D_BLEND_SRC_ALPHA_SATURATE: return SDL_GPU_BLENDFACTOR_SRC_ALPHA_SATURATE;
+    case RECOMP_D3D_BLEND_CONSTANT_COLOR:
+    case RECOMP_D3D_BLEND_CONSTANT_ALPHA: return SDL_GPU_BLENDFACTOR_CONSTANT_COLOR;
+    case RECOMP_D3D_BLEND_INV_CONSTANT_COLOR:
+    case RECOMP_D3D_BLEND_INV_CONSTANT_ALPHA: return SDL_GPU_BLENDFACTOR_ONE_MINUS_CONSTANT_COLOR;
+    default: return SDL_GPU_BLENDFACTOR_ONE;
+    }
+}
+
+SDL_GPUBlendOp hostBlendOp(RecompD3dBlendOp op)
+{
+    switch (op) {
+    case RECOMP_D3D_BLEND_OP_MIN: return SDL_GPU_BLENDOP_MIN;
+    case RECOMP_D3D_BLEND_OP_MAX: return SDL_GPU_BLENDOP_MAX;
+    case RECOMP_D3D_BLEND_OP_SUBTRACT: return SDL_GPU_BLENDOP_SUBTRACT;
+    case RECOMP_D3D_BLEND_OP_REVERSE_SUBTRACT: return SDL_GPU_BLENDOP_REVERSE_SUBTRACT;
+    case RECOMP_D3D_BLEND_OP_ADD:
+    default: return SDL_GPU_BLENDOP_ADD;
+    }
+}
+
+SDL_GPUCompareOp hostCompareOp(RecompD3dCompareFunc func)
+{
+    switch (func) {
+    case RECOMP_D3D_COMPARE_NEVER: return SDL_GPU_COMPAREOP_NEVER;
+    case RECOMP_D3D_COMPARE_LESS: return SDL_GPU_COMPAREOP_LESS;
+    case RECOMP_D3D_COMPARE_EQUAL: return SDL_GPU_COMPAREOP_EQUAL;
+    case RECOMP_D3D_COMPARE_LESS_EQUAL: return SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    case RECOMP_D3D_COMPARE_GREATER: return SDL_GPU_COMPAREOP_GREATER;
+    case RECOMP_D3D_COMPARE_NOT_EQUAL: return SDL_GPU_COMPAREOP_NOT_EQUAL;
+    case RECOMP_D3D_COMPARE_GREATER_EQUAL: return SDL_GPU_COMPAREOP_GREATER_OR_EQUAL;
+    case RECOMP_D3D_COMPARE_ALWAYS: return SDL_GPU_COMPAREOP_ALWAYS;
+    default: return SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    }
+}
+
+SDL_GPUStencilOp hostStencilOp(RecompD3dStencilOp op)
+{
+    switch (op) {
+    case RECOMP_D3D_STENCIL_KEEP: return SDL_GPU_STENCILOP_KEEP;
+    case RECOMP_D3D_STENCIL_ZERO: return SDL_GPU_STENCILOP_ZERO;
+    case RECOMP_D3D_STENCIL_REPLACE: return SDL_GPU_STENCILOP_REPLACE;
+    case RECOMP_D3D_STENCIL_INCRSAT: return SDL_GPU_STENCILOP_INCREMENT_AND_CLAMP;
+    case RECOMP_D3D_STENCIL_DECRSAT: return SDL_GPU_STENCILOP_DECREMENT_AND_CLAMP;
+    case RECOMP_D3D_STENCIL_INVERT: return SDL_GPU_STENCILOP_INVERT;
+    case RECOMP_D3D_STENCIL_INCRWRAP: return SDL_GPU_STENCILOP_INCREMENT_AND_WRAP;
+    case RECOMP_D3D_STENCIL_DECRWRAP: return SDL_GPU_STENCILOP_DECREMENT_AND_WRAP;
+    default: return SDL_GPU_STENCILOP_KEEP;
+    }
+}
+
+SDL_GPUSamplerAddressMode hostAddressMode(uint32_t mode)
+{
+    switch (mode) {
+    case 1: return SDL_GPU_SAMPLERADDRESSMODE_REPEAT;          // WRAP
+    case 2: return SDL_GPU_SAMPLERADDRESSMODE_MIRRORED_REPEAT; // MIRROR
+    case 3: return SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;    // CLAMP
+    case 4: return SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;    // BORDER: SDL_GPU has no border color
+    case 5: return SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;    // CLAMPTOEDGE
+    default: return SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    }
+}
+
+uint64_t textureFingerprint(const void *bytes, uint32_t count)
+{
+    const auto *data = static_cast<const uint8_t *>(bytes);
+    uint64_t hash = 0xcbf29ce484222325ull ^ count;
+    if (count < 8u) {
+        for (uint32_t i = 0u; i < count; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
+        return hash;
+    }
+    constexpr uint32_t kSamples = 128u;
+    for (uint32_t i = 0u; i < kSamples; ++i) {
+        uint64_t word;
+        std::memcpy(&word, data + static_cast<uint64_t>(count - 8u) * i / (kSamples - 1u), 8u);
+        hash = (hash ^ word) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+// Vertex programs key shaders and pipelines, so every token counts; the
+// sampled texture fingerprint would let two programs share one shader.
+uint64_t programHash(const uint32_t (*tokens)[4], uint32_t count)
+{
+    const auto *data = reinterpret_cast<const uint8_t *>(tokens);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0u; i < count * 16u; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
+    return hash;
+}
+
+SDL_GPUTextureFormat hostTextureFormat(uint32_t format_byte)
+{
+    switch (format_byte) {
+    case RECOMP_D3D_TEXTURE_FORMAT_DXT1: return SDL_GPU_TEXTUREFORMAT_BC1_RGBA_UNORM;
+    case RECOMP_D3D_TEXTURE_FORMAT_DXT3: return SDL_GPU_TEXTUREFORMAT_BC2_RGBA_UNORM;
+    case RECOMP_D3D_TEXTURE_FORMAT_DXT5: return SDL_GPU_TEXTUREFORMAT_BC3_RGBA_UNORM;
+    case RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8:
+    case RECOMP_D3D_TEXTURE_FORMAT_P8: return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    case RECOMP_D3D_TEXTURE_FORMAT_A8: return SDL_GPU_TEXTUREFORMAT_A8_UNORM;
+    default: return SDL_GPU_TEXTUREFORMAT_INVALID;
+    }
+}
+
+bool isSwizzledTextureFormat(uint32_t format_byte)
+{
+    return format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8R8G8B8 ||
+           format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8;
+}
+
+struct QueuedDraw {
+    SDL_GPUGraphicsPipeline *pipeline = nullptr;
+    uint32_t vertex_offset = 0;
+    uint32_t vertex_size = 0;
+    uint32_t index_offset = 0;
+    uint32_t index_size = 0;
+    uint32_t index_count = 0;
+    int32_t base_vertex = 0;
+    SDL_GPUTexture *texture = nullptr;
+    SDL_GPUTexture *mask_texture = nullptr;
+    SDL_GPUSampler *sampler0 = nullptr;
+    SDL_GPUSampler *sampler1 = nullptr;
+    uint32_t constant_color = 0;
+    // D3D8 constant alpha: all four blend constants take the color's alpha.
+    bool constant_alpha = false;
+    uint8_t stencil_ref = 0;
+    // Guest sub-rect viewport in host target pixels; zero width keeps the target.
+    SDL_GPUViewport viewport{};
+    uint32_t uniform_offset = 0;
+    uint32_t vs_uniform_size = 0;
+    uint32_t fs_uniform_size = 0;
+    uint32_t program_offset = 0;
+    // Modern water: this draw reads the scene textures, or also renders into water_depth.
+    bool water_scene = false;
+    SDL_GPUGraphicsPipeline *water_depth_pipeline = nullptr;
+};
+
+struct DrawSegment {
+    SDL_GPUTexture *target_color = nullptr;
+    SDL_GPUTexture *target_depth = nullptr;
+    float target_w = 0.0f;
+    float target_h = 0.0f;
+    bool water_depth_pending = false;  // a draw has a water_depth_pipeline
+    std::vector<uint8_t> vertex_data;
+    std::vector<uint8_t> index_data;
+    std::vector<float> uniform_data;
+    std::vector<QueuedDraw> draws;
+};
+
+struct ShaderPair {
+    SDL_GPUShader *vertex_shader = nullptr;
+    SDL_GPUShader *fragment_shader = nullptr;
+};
+
+struct PipelineKey {
+    uint32_t fvf = 0;
+    uint32_t vertex_stride = 0;
+    uint32_t program_count = 0;
+    uint64_t program_hash = 0;
+    SDL_GPUPrimitiveType primitive = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    RecompD3dCullMode cull_mode = RECOMP_D3D_CULL_NONE;
+    SDL_GPUTextureFormat color_format = SDL_GPU_TEXTUREFORMAT_INVALID;
+    SDL_GPUTextureFormat depth_format = SDL_GPU_TEXTUREFORMAT_INVALID;
+    SDL_GPUSampleCount sample_count = SDL_GPU_SAMPLECOUNT_1;
+    bool alpha_to_coverage = false;
+
+    bool depth_test_enable = false;
+    bool depth_write_enable = false;
+    RecompD3dCompareFunc depth_func = RECOMP_D3D_COMPARE_LESS_EQUAL;
+    bool stencil_enable = false;
+    uint8_t stencil_read_mask = 0xff;
+    uint8_t stencil_write_mask = 0xff;
+    RecompD3dCompareFunc stencil_func = RECOMP_D3D_COMPARE_ALWAYS;
+    RecompD3dStencilOp stencil_fail = RECOMP_D3D_STENCIL_KEEP;
+    RecompD3dStencilOp stencil_zfail = RECOMP_D3D_STENCIL_KEEP;
+    RecompD3dStencilOp stencil_pass = RECOMP_D3D_STENCIL_KEEP;
+
+    bool blend_enable = false;
+    uint8_t color_write_mask = 0x0f;
+    RecompD3dBlendFactor src_factor = RECOMP_D3D_BLEND_ONE;
+    RecompD3dBlendFactor dst_factor = RECOMP_D3D_BLEND_ZERO;
+    RecompD3dBlendOp blend_op = RECOMP_D3D_BLEND_OP_ADD;
+
+    bool operator==(const PipelineKey &o) const {
+        return fvf == o.fvf &&
+               vertex_stride == o.vertex_stride &&
+               program_count == o.program_count &&
+               program_hash == o.program_hash &&
+               primitive == o.primitive &&
+               cull_mode == o.cull_mode &&
+               color_format == o.color_format &&
+               depth_format == o.depth_format &&
+               sample_count == o.sample_count &&
+               alpha_to_coverage == o.alpha_to_coverage &&
+               depth_test_enable == o.depth_test_enable &&
+               depth_write_enable == o.depth_write_enable &&
+               depth_func == o.depth_func &&
+               stencil_enable == o.stencil_enable &&
+               stencil_read_mask == o.stencil_read_mask &&
+               stencil_write_mask == o.stencil_write_mask &&
+               stencil_func == o.stencil_func &&
+               stencil_fail == o.stencil_fail &&
+               stencil_zfail == o.stencil_zfail &&
+               stencil_pass == o.stencil_pass &&
+               blend_enable == o.blend_enable &&
+               color_write_mask == o.color_write_mask &&
+               src_factor == o.src_factor &&
+               dst_factor == o.dst_factor &&
+               blend_op == o.blend_op;
+    }
+};
+
+struct PipelineKeyHash {
+    size_t operator()(const PipelineKey &k) const {
+        size_t h = k.fvf ^ (static_cast<size_t>(k.vertex_stride) << 8) ^ (static_cast<size_t>(k.program_count) << 16) ^ k.program_hash;
+        h ^= (static_cast<size_t>(k.primitive) << 24) ^ (static_cast<size_t>(k.cull_mode) << 28);
+        h ^= (static_cast<size_t>(k.color_format) << 4) ^ (static_cast<size_t>(k.depth_format) << 12);
+        h ^= (static_cast<size_t>(k.sample_count) << 30);
+        h ^= (static_cast<size_t>(k.color_write_mask) << 20) ^ (static_cast<size_t>(k.blend_enable) << 27);
+        h ^= (static_cast<size_t>(k.src_factor) << 2) ^ (static_cast<size_t>(k.dst_factor) << 6);
+        h ^= (static_cast<size_t>(k.depth_test_enable) << 1) ^ (static_cast<size_t>(k.depth_func) << 8);
+        h ^= (static_cast<size_t>(k.stencil_enable) << 15) ^ (static_cast<size_t>(k.stencil_func) << 18);
+        return h;
+    }
+};
+
+} // namespace
+
+struct RecompD3dPresenter {
+    RecompD3dPresenterConfig config{};
+    std::thread::id owner_thread;
+    SDL_Window *window = nullptr;
+    SDL_GPUDevice *device = nullptr;
+    SDL_GPUTexture *backbuffer_color = nullptr;
+    SDL_GPUTexture *backbuffer_depth = nullptr;
+    SDL_GPUTexture *backbuffer_resolve = nullptr;
+    SDL_GPUTexture *backbuffer_copy = nullptr;
+    bool copy_mips = false;  // backbuffer_copy and frontbuffer_copy carry mip chains
+    bool frontbuffer_used = false;  // Present refreshes frontbuffer_copy once a draw reads it
+    SDL_GPUTexture *frontbuffer_copy = nullptr;
+    SDL_GPUTexture *present_texture = nullptr;  // the shown picture with mips, for a smaller window
+    bool present_texture_failed = false;  // creation failed once; blit from mip 0 from then on
+    SDL_GPUTexture *dummy_texture = nullptr;
+    uint32_t msaa_count = 1u;
+    SDL_GPUSampleCount msaa_samples = SDL_GPU_SAMPLECOUNT_1;
+
+    // Persistent samplers
+    SDL_GPUSampler *point_sampler = nullptr;
+    SDL_GPUSampler *filter_sampler = nullptr;
+    SDL_GPUSampler *program_mask_sampler = nullptr;
+    SDL_GPUSampler *address_samplers[6][6]{}; // [address_u][address_v]
+
+    // Persistent dynamic ring buffers
+    SDL_GPUBuffer *draw_vertex_buffer = nullptr;
+    SDL_GPUBuffer *draw_index_buffer = nullptr;
+    SDL_GPUTransferBuffer *draw_vertex_transfer = nullptr;
+    SDL_GPUTransferBuffer *draw_index_transfer = nullptr;
+    uint32_t draw_vertex_capacity = kInitialVertexCapacity;
+    uint32_t draw_index_capacity = kInitialIndexCapacity;
+    uint32_t draw_vertex_used = 0u;
+    uint32_t draw_index_used = 0u;
+
+    // Current segment batch
+    DrawSegment segment;
+
+    // Active command buffer
+    SDL_GPUCommandBuffer *current_command_buffer = nullptr;
+
+    // Shader & Pipeline caches
+    std::mutex shader_mutex;
+    std::unordered_map<uint64_t, ShaderPair> shader_cache;
+    std::unordered_map<PipelineKey, SDL_GPUGraphicsPipeline *, PipelineKeyHash> pipelines;
+    std::thread precompile_thread;
+    std::atomic<bool> precompile_stop{false};
+
+    // Texture cache
+    std::vector<TextureEntry> textures = std::vector<TextureEntry>(kTextureSlots);
+    std::unordered_multimap<uint32_t, uint32_t> texture_index;
+    uint32_t texture_count = 0u;
+    uint32_t next_texture_slot = 0u;
+    // Cache textures replaced while queued draws still bind them; flushSegment
+    // releases them once those draws are recorded.
+    std::vector<SDL_GPUTexture *> retired_textures;
+
+    // Render / depth targets
+    std::vector<RenderTargetEntry> render_targets;
+    std::vector<DepthTargetEntry> depth_targets;
+    uint64_t target_bytes = 0u;
+
+    bool close_requested = false;
+    uint32_t present_count = 0u;
+    uint32_t draw_count = 0u;
+
+    // RECOMP_PERF_COUNTER: present rate and gaps, reported once per second.
+    bool performance_counter = false;
+    std::chrono::steady_clock::time_point second_start{}, last_present{};
+    uint32_t second_presents = 0u;
+    double second_max_ms = 0.0;
+
+    float scale = 1.0f;
+    bool widescreen = false;
+    uint32_t aspect_w = 16u, aspect_h = 9u; // widescreen shape, from RECOMP_D3D_WIDESCREEN
+
+    // SetGammaRamp applies when a frame is shown; guest reads stay uncorrected.
+    bool gamma_enabled = false;
+    float gamma_ramp[256][4]{};
+    SDL_GPUGraphicsPipeline *gamma_pipeline = nullptr;
+    SDL_GPUTexture *gamma_target = nullptr;
+    unsigned frame_dump_count = 0u;
+    uint64_t next_frame_dump_ms = 0u;
+    bool use_spirv = false;
+    bool backbuffer_resolved = false;
+    SDL_GPUTextureFormat depth_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT;
+    bool a8_supported = true;
+    bool simple_water = false;
+
+    /* Modern water reads the scene drawn before it: a color copy taken at
+       the frame's first water draw, and a single-sample depth that the
+       depth-writing draws render into a second time, since SDL_GPU cannot
+       sample multisampled depth. That second pass runs while water was drawn
+       this frame or the last. */
+    SDL_GPUTexture *water_color = nullptr;
+    SDL_GPUTexture *water_depth = nullptr;
+    uint32_t water_present = UINT32_MAX;       // present_count at the last water draw
+    uint32_t water_copy_present = UINT32_MAX;  // present_count whose scene water_color holds
+    bool water_depth_live = false;             // water_depth was cleared with the main depth this frame
+
+    // Consecutive draws usually share a pipeline; skip the map lookup.
+    PipelineKey last_pkey{};
+    SDL_GPUGraphicsPipeline *last_pipeline = nullptr;
+};
+
+inline uint32_t mainHeight(const RecompD3dPresenter *p) {
+    return static_cast<uint32_t>(p->config.height * p->scale + 0.5f);
+}
+
+inline uint32_t presentClientWidth(const RecompD3dPresenter *p, uint32_t height) {
+    return static_cast<uint32_t>(p->widescreen
+        ? (height * p->aspect_w + p->aspect_h - 1u) / p->aspect_h
+        : (height * 4u + 1u) / 3u);
+}
+
+inline uint32_t mainWidth(const RecompD3dPresenter *p) {
+    return p->scale == 1.0f
+        ? p->config.width
+        : presentClientWidth(p, mainHeight(p));
+}
+
+inline RecompWidescreen2dScale widescreen2dScale(const RecompD3dPresenter *p,
+    float left, float right, float top, float bottom) {
+    return recomp_widescreen_2d_scale(static_cast<float>(p->config.width),
+        static_cast<float>(p->config.height), p->aspect_w, p->aspect_h,
+        left, right, top, bottom);
+}
+
+namespace {
+
+RecompD3dPresenter *active_presenter = nullptr;
+bool immediate_present_setting = false;
+
+// The guest paces itself to 60 Hz. On Linux (gamescope on Steam Deck),
+// MAILBOX presents without a second wait for the swapchain.
+bool preferMailbox(bool immediate)
+{
+#ifdef __linux__
+    (void)immediate;
+    return true;
+#else
+    return immediate;
+#endif
+}
+
+/* The Windows virtual-key code of each key the keyboard model tracks, so it
+   latches presses between samples as on Windows. */
+uint32_t virtualKey(SDL_Scancode code)
+{
+    if (code >= SDL_SCANCODE_A && code <= SDL_SCANCODE_Z) return 'A' + (code - SDL_SCANCODE_A);
+    switch (code) {
+    case SDL_SCANCODE_BACKSPACE: return 0x08u;
+    case SDL_SCANCODE_RETURN: return 0x0du;
+    case SDL_SCANCODE_ESCAPE: return 0x1bu;
+    case SDL_SCANCODE_LEFT: return 0x25u;
+    case SDL_SCANCODE_UP: return 0x26u;
+    case SDL_SCANCODE_RIGHT: return 0x27u;
+    case SDL_SCANCODE_DOWN: return 0x28u;
+    default: return RECOMP_INPUT_KEY_COUNT;
+    }
+}
+
+void pumpEvents(RecompD3dPresenter *presenter)
+{
+    SDL_PumpEvents();
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        // F11 and Alt+Enter switch fullscreen and never reach the game.
+        if (event.type == SDL_EVENT_KEY_DOWN && (event.key.key == SDLK_F11 ||
+                ((event.key.mod & SDL_KMOD_ALT) != 0 && (event.key.key == SDLK_RETURN || event.key.key == SDLK_KP_ENTER)))) {
+            if (!event.key.repeat)
+                SDL_SetWindowFullscreen(presenter->window, (SDL_GetWindowFlags(presenter->window) & SDL_WINDOW_FULLSCREEN) == 0);
+            continue;
+        }
+        if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) {
+            const uint32_t key = virtualKey(event.key.scancode);
+            const bool down = event.type == SDL_EVENT_KEY_DOWN;
+            if (!event.key.repeat) recomp_input_keyboard_event(key, down);
+            // Backspace, Enter and Esc are typed text too, as WM_CHAR sends them.
+            if (down && (key == 0x08u || key == 0x0du || key == 0x1bu)) recomp_input_keyboard_char(key);
+        } else if (event.type == SDL_EVENT_TEXT_INPUT) {
+            for (const char *c = event.text.text; *c != '\0'; ++c)
+                recomp_input_keyboard_char(static_cast<unsigned char>(*c));
+        } else if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+            recomp_input_keyboard_reset();
+        } else if (event.type == SDL_EVENT_QUIT) {
+            presenter->close_requested = true;
+        } else if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            if (!presenter->window || event.window.windowID == 0 ||
+                event.window.windowID == SDL_GetWindowID(presenter->window)) {
+                presenter->close_requested = true;
+            }
+        }
+    }
+}
+
+void reportPerformance(RecompD3dPresenter *presenter)
+{
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    if (presenter->second_presents++ == 0u) presenter->second_start = now;
+    else presenter->second_max_ms = std::max(presenter->second_max_ms,
+        std::chrono::duration<double, std::milli>(now - presenter->last_present).count());
+    presenter->last_present = now;
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(now - presenter->second_start).count();
+    if (elapsed_ms < 1000.0) return;
+    const uint32_t frames = presenter->second_presents - 1u;
+    std::fprintf(stderr, "recomp performance: present=%u fps=%.2f frame_ms=%.3f max_ms=%.1f draws=%u\n",
+        presenter->present_count, frames * 1000.0 / elapsed_ms, elapsed_ms / frames,
+        presenter->second_max_ms, presenter->draw_count / frames);
+    presenter->second_presents = 1u;
+    presenter->second_start = now;
+    presenter->second_max_ms = 0.0;
+    presenter->draw_count = 0u;
+}
+
+/* RECOMP_D3D_FRAME_DUMP: which dump, if any, this present writes, with the
+   same _AT, _COUNT and _INTERVAL_MS rules as the D3D11 presenter. */
+const char *frameDumpPath(RecompD3dPresenter *presenter, uint32_t present_count, char (&burst)[1024])
+{
+    const char *path = std::getenv("RECOMP_D3D_FRAME_DUMP");
+    if (path == nullptr) return nullptr;
+    const char *count_text = std::getenv("RECOMP_D3D_FRAME_DUMP_COUNT");
+    const unsigned count = count_text ? static_cast<unsigned>(std::strtoul(count_text, nullptr, 10)) : 1u;
+    if (presenter->frame_dump_count >= (count == 0u ? 1u : count)) return nullptr;
+    const char *at_text = std::getenv("RECOMP_D3D_FRAME_DUMP_AT");
+    const unsigned at = at_text ? static_cast<unsigned>(std::strtoul(at_text, nullptr, 10)) : 1u;
+    if (present_count < at) return nullptr;
+    const char *interval_text = std::getenv("RECOMP_D3D_FRAME_DUMP_INTERVAL_MS");
+    const uint64_t interval_ms = interval_text ? std::strtoul(interval_text, nullptr, 10) : 0u;
+    const uint64_t now = SDL_GetTicks();
+    if (now < presenter->next_frame_dump_ms) return nullptr;
+    presenter->next_frame_dump_ms = now + interval_ms;
+    const unsigned index = presenter->frame_dump_count++;
+    if (count > 1u) {
+        std::snprintf(burst, sizeof burst, "%s.%03u.bmp", path, index);
+        return burst;
+    }
+    return path;
+}
+
+/* Writes BGRA rows, top row first, as a bottom-up 24-bit BMP. */
+void writeBmp(const char *path, const uint8_t *pixels, uint32_t width, uint32_t height)
+{
+    const uint32_t row_bytes = width * 3u;
+    const uint32_t padded = (row_bytes + 3u) & ~3u;
+    const uint32_t image_bytes = padded * height;
+    FILE *file = std::fopen(path, "wb");
+    if (file == nullptr) return;
+    uint8_t header[54]{};
+    const uint32_t total = 54u + image_bytes, offset = 54u, info_size = 40u;
+    const uint16_t planes = 1u, bpp = 24u;
+    header[0] = 'B';
+    header[1] = 'M';
+    std::memcpy(header + 2, &total, 4);
+    std::memcpy(header + 10, &offset, 4);
+    std::memcpy(header + 14, &info_size, 4);
+    std::memcpy(header + 18, &width, 4);
+    std::memcpy(header + 22, &height, 4);
+    std::memcpy(header + 26, &planes, 2);
+    std::memcpy(header + 28, &bpp, 2);
+    std::memcpy(header + 34, &image_bytes, 4);
+    std::fwrite(header, 1, sizeof header, file);
+    std::vector<uint8_t> row(padded, 0u);
+    for (uint32_t y = 0u; y < height; ++y) {
+        const uint8_t *src = pixels + static_cast<size_t>(height - 1u - y) * width * 4u;
+        for (uint32_t x = 0u; x < width; ++x) std::memcpy(&row[x * 3u], src + x * 4u, 3u);
+        std::fwrite(row.data(), 1, padded, file);
+    }
+    std::fclose(file);
+}
+
+SDL_GPUCommandBuffer *getCommandBuffer(RecompD3dPresenter *presenter)
+{
+    if (!presenter->current_command_buffer) {
+        presenter->current_command_buffer = SDL_AcquireGPUCommandBuffer(presenter->device);
+    }
+    return presenter->current_command_buffer;
+}
+
+void ensureBackbufferResolved(RecompD3dPresenter *presenter)
+{
+    if (!presenter->backbuffer_resolved && presenter->msaa_samples != SDL_GPU_SAMPLECOUNT_1 &&
+        presenter->backbuffer_resolve && presenter->backbuffer_color &&
+        presenter->backbuffer_resolve != presenter->backbuffer_color) {
+        SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+        SDL_GPUColorTargetInfo color_info{};
+        color_info.texture = presenter->backbuffer_color;
+        color_info.load_op = SDL_GPU_LOADOP_LOAD;
+        color_info.store_op = SDL_GPU_STOREOP_RESOLVE_AND_STORE;
+        color_info.resolve_texture = presenter->backbuffer_resolve;
+        SDL_GPURenderPass *rpass = SDL_BeginGPURenderPass(cmdbuf, &color_info, 1, nullptr);
+        if (rpass) {
+            SDL_EndGPURenderPass(rpass);
+        }
+        presenter->backbuffer_resolved = true;
+    }
+}
+
+uint32_t mipLevels(uint32_t width, uint32_t height)
+{
+    uint32_t levels = 1u;
+    while (((std::max)(width, height) >> levels) != 0u) ++levels;
+    return levels;
+}
+
+/* The mip whose texels cover the window's pixels, so the blit averages what it
+   drops instead of taking one bilinear tap from level 0. An upscale keeps 0.
+   Outside the anonymous namespace so the presenter test can call it. */
+} // namespace
+uint32_t presentMipLevel(uint32_t width, uint32_t height,
+    uint32_t destination_width, uint32_t destination_height)
+{
+    if (destination_width == 0u || destination_height == 0u) return 0u;
+    const float ratio = (std::max)(static_cast<float>(width) / destination_width,
+        static_cast<float>(height) / destination_height);
+    if (ratio < 2.0f) return 0u;
+    const uint32_t last = mipLevels(width, height) - 1u;
+    return (std::min)(static_cast<uint32_t>(std::floor(std::log2(ratio))), last);
+}
+namespace {
+
+// Creates the mipped present copy once per main target size (a shape change drops it).
+bool ensurePresentTexture(RecompD3dPresenter *presenter)
+{
+    if (presenter->present_texture != nullptr) return true;
+    if (presenter->present_texture_failed) return false;
+    SDL_GPUTextureCreateInfo info{};
+    info.type = SDL_GPU_TEXTURETYPE_2D;
+    info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    info.width = mainWidth(presenter);
+    info.height = mainHeight(presenter);
+    info.layer_count_or_depth = 1;
+    info.num_levels = mipLevels(info.width, info.height);
+    presenter->present_texture = SDL_CreateGPUTexture(presenter->device, &info);
+    if (presenter->present_texture == nullptr) {
+        presenter->present_texture_failed = true;  // no full-size allocation retry every present
+        std::fprintf(stderr, "recomp d3d presenter: present mips unavailable: %s\n", SDL_GetError());
+        return false;
+    }
+    return true;
+}
+
+// Modern water's depth pass runs while water was drawn this frame or the last.
+bool waterDepthWanted(const RecompD3dPresenter *p)
+{
+    return p->water_present != UINT32_MAX && p->present_count - p->water_present <= 1u;
+}
+
+// Creates modern water's scene textures once; false when the device cannot.
+bool ensureWaterTargets(RecompD3dPresenter *p)
+{
+    if (p->water_depth) return true;
+    SDL_GPUTextureCreateInfo info{};
+    info.type = SDL_GPU_TEXTURETYPE_2D;
+    info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    info.width = mainWidth(p);
+    info.height = mainHeight(p);
+    info.layer_count_or_depth = 1;
+    info.num_levels = 1;
+    if (!p->water_color) p->water_color = SDL_CreateGPUTexture(p->device, &info);
+    info.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    if (p->water_color && SDL_GPUTextureSupportsFormat(p->device, info.format, info.type, info.usage)) {
+        p->water_depth = SDL_CreateGPUTexture(p->device, &info);
+    }
+    return p->water_depth != nullptr;
+}
+
+void unindexTexture(RecompD3dPresenter *presenter, uint32_t slot)
+{
+    const auto range = presenter->texture_index.equal_range(presenter->textures[slot].data);
+    for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == slot) {
+            presenter->texture_index.erase(it);
+            return;
+        }
+    }
+}
+
+void retireTexture(RecompD3dPresenter *presenter, TextureEntry &entry)
+{
+    if (entry.texture) presenter->retired_textures.push_back(entry.texture);
+    entry.texture = nullptr;
+}
+
+void releaseRetiredTextures(RecompD3dPresenter *presenter)
+{
+    for (SDL_GPUTexture *texture : presenter->retired_textures) {
+        SDL_ReleaseGPUTexture(presenter->device, texture);
+    }
+    presenter->retired_textures.clear();
+}
+
+RenderTargetEntry *findRenderTarget(RecompD3dPresenter *presenter, const RecompD3dTextureDesc &desc)
+{
+    for (auto &entry : presenter->render_targets) {
+        if (entry.desc.data == desc.data && entry.desc.width == desc.width && entry.desc.height == desc.height) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+/* As in the D3D11 presenter, a target that cannot be created declines the
+   clear or draw; falling back to the back buffer would put it on screen. */
+RecompD3dPresenterError findOrCreateRenderTarget(
+    RecompD3dPresenter *presenter, const RecompD3dTextureDesc &desc, RenderTargetEntry *&entry)
+{
+    entry = findRenderTarget(presenter, desc);
+    if (entry) return RECOMP_D3D_PRESENTER_OK;
+    const uint64_t bytes = static_cast<uint64_t>(desc.width) * desc.height * 4u;
+    if (bytes > kTargetByteLimit - presenter->target_bytes) {
+        std::fprintf(stderr, "recomp d3d presenter: target memory budget exhausted\n");
+        return RECOMP_D3D_PRESENTER_OUT_OF_MEMORY;
+    }
+    SDL_GPUTextureCreateInfo rt_info{};
+    rt_info.type = SDL_GPU_TEXTURETYPE_2D;
+    rt_info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    rt_info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    rt_info.width = desc.width;
+    rt_info.height = desc.height;
+    rt_info.layer_count_or_depth = 1;
+    rt_info.num_levels = 1;
+    SDL_GPUTexture *texture = SDL_CreateGPUTexture(presenter->device, &rt_info);
+    if (!texture) {
+        std::fprintf(stderr, "recomp d3d presenter: render target create failed data=0x%08X size=%ux%u: %s\n",
+            desc.data, desc.width, desc.height, SDL_GetError());
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+    presenter->render_targets.push_back({desc, texture, desc.width, desc.height});
+    presenter->target_bytes += bytes;
+    entry = &presenter->render_targets.back();
+    return RECOMP_D3D_PRESENTER_OK;
+}
+
+SDL_GPUTexture *lookupDepthTarget(
+    RecompD3dPresenter *presenter,
+    const RecompD3dPresenterTarget &target)
+{
+    if (target.no_depth) {
+        return nullptr;
+    }
+    if (!target.custom_depth) {
+        return target.offscreen ? nullptr : presenter->backbuffer_depth;
+    }
+
+    const RecompD3dTextureDesc &desc = target.depth;
+    const uint32_t guest_width = target.offscreen ? target.color.width : presenter->config.width;
+    const uint32_t guest_height = target.offscreen ? target.color.height : presenter->config.height;
+    if (desc.data == 0u || desc.width == 0u || desc.height == 0u ||
+        desc.width != guest_width || desc.height != guest_height) {
+        return nullptr;
+    }
+
+    /* A custom depth bound with the main target must match its host size and
+       samples, as in the D3D11 presenter; like the main target, it is outside
+       the offscreen budget. */
+    const bool host_main = !target.offscreen &&
+        (presenter->scale != 1.0f || presenter->msaa_count > 1u);
+    for (const auto &entry : presenter->depth_targets) {
+        if (entry.desc.data == desc.data && entry.desc.width == desc.width &&
+            entry.desc.height == desc.height && entry.host_main == host_main) {
+            return entry.texture;
+        }
+    }
+
+    const uint32_t width = host_main ? mainWidth(presenter) : desc.width;
+    const uint32_t height = host_main ? mainHeight(presenter) : desc.height;
+    const uint64_t bytes = host_main ? 0u : static_cast<uint64_t>(width) * height * 4u;
+    if (bytes > kTargetByteLimit - presenter->target_bytes) {
+        return nullptr;
+    }
+
+    SDL_GPUTextureCreateInfo dt_info{};
+    dt_info.type = SDL_GPU_TEXTURETYPE_2D;
+    dt_info.format = presenter->depth_format;
+    dt_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    dt_info.width = width;
+    dt_info.height = height;
+    dt_info.layer_count_or_depth = 1;
+    dt_info.num_levels = 1;
+    dt_info.sample_count = host_main ? presenter->msaa_samples : SDL_GPU_SAMPLECOUNT_1;
+    SDL_GPUTexture *new_dt = SDL_CreateGPUTexture(presenter->device, &dt_info);
+    if (!new_dt) return nullptr;
+
+    presenter->depth_targets.push_back({desc, new_dt, bytes, host_main});
+    presenter->target_bytes += bytes;
+    return new_dt;
+}
+
+SDL_GPUSampler *lookupDrawSampler(RecompD3dPresenter *presenter, uint32_t address_u, uint32_t address_v)
+{
+    uint32_t u = address_u <= 5u ? address_u : 1u;
+    uint32_t v = address_v <= 5u ? address_v : 1u;
+    if (presenter->address_samplers[u][v] != nullptr) {
+        return presenter->address_samplers[u][v];
+    }
+
+    SDL_GPUSamplerCreateInfo desc{};
+    desc.min_filter = SDL_GPU_FILTER_LINEAR;
+    desc.mag_filter = SDL_GPU_FILTER_LINEAR;
+    desc.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    desc.address_mode_u = hostAddressMode(u);
+    desc.address_mode_v = hostAddressMode(v);
+    desc.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    desc.enable_anisotropy = false;
+    desc.max_lod = 1000.0f;  // the zero default would sample only the base mip level
+    presenter->address_samplers[u][v] = SDL_CreateGPUSampler(presenter->device, &desc);
+    return presenter->address_samplers[u][v] ? presenter->address_samplers[u][v] : presenter->filter_sampler;
+}
+
+bool ensureDynamicBuffers(RecompD3dPresenter *presenter, uint32_t req_vbytes, uint32_t req_ibytes)
+{
+    if (req_vbytes > presenter->draw_vertex_capacity) {
+        if (presenter->current_command_buffer) {
+            SDL_SubmitGPUCommandBuffer(presenter->current_command_buffer);
+            presenter->current_command_buffer = nullptr;
+        }
+        uint32_t new_cap = std::max(req_vbytes * 2u, presenter->draw_vertex_capacity * 2u);
+        if (presenter->draw_vertex_buffer) SDL_ReleaseGPUBuffer(presenter->device, presenter->draw_vertex_buffer);
+        if (presenter->draw_vertex_transfer) SDL_ReleaseGPUTransferBuffer(presenter->device, presenter->draw_vertex_transfer);
+
+        SDL_GPUBufferCreateInfo binfo{SDL_GPU_BUFFERUSAGE_VERTEX, new_cap, 0};
+        presenter->draw_vertex_buffer = SDL_CreateGPUBuffer(presenter->device, &binfo);
+        SDL_GPUTransferBufferCreateInfo tinfo{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, new_cap, 0};
+        presenter->draw_vertex_transfer = SDL_CreateGPUTransferBuffer(presenter->device, &tinfo);
+        presenter->draw_vertex_capacity = new_cap;
+        presenter->draw_vertex_used = 0u;
+        if (!presenter->draw_vertex_buffer || !presenter->draw_vertex_transfer) {
+            presenter->draw_vertex_capacity = 0u;  // the next flush retries the allocation
+            return false;
+        }
+    }
+
+    if (req_ibytes > presenter->draw_index_capacity) {
+        if (presenter->current_command_buffer) {
+            SDL_SubmitGPUCommandBuffer(presenter->current_command_buffer);
+            presenter->current_command_buffer = nullptr;
+        }
+        uint32_t new_cap = std::max(req_ibytes * 2u, presenter->draw_index_capacity * 2u);
+        if (presenter->draw_index_buffer) SDL_ReleaseGPUBuffer(presenter->device, presenter->draw_index_buffer);
+        if (presenter->draw_index_transfer) SDL_ReleaseGPUTransferBuffer(presenter->device, presenter->draw_index_transfer);
+
+        SDL_GPUBufferCreateInfo binfo{SDL_GPU_BUFFERUSAGE_INDEX, new_cap, 0};
+        presenter->draw_index_buffer = SDL_CreateGPUBuffer(presenter->device, &binfo);
+        SDL_GPUTransferBufferCreateInfo tinfo{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, new_cap, 0};
+        presenter->draw_index_transfer = SDL_CreateGPUTransferBuffer(presenter->device, &tinfo);
+        presenter->draw_index_capacity = new_cap;
+        presenter->draw_index_used = 0u;
+        if (!presenter->draw_index_buffer || !presenter->draw_index_transfer) {
+            presenter->draw_index_capacity = 0u;
+            return false;
+        }
+    }
+    return true;
+}
+
+void flushSegment(RecompD3dPresenter *presenter);
+
+SDL_GPUTexture *prepareTexture(RecompD3dPresenter *presenter, const RecompD3dPresenterDrawCommand &draw)
+{
+    const RecompD3dTextureDesc &desc = draw.texture;
+    if (!draw.has_texture || desc.data == 0u || desc.width == 0u || desc.height == 0u) {
+        return nullptr;
+    }
+    if (draw.texture_is_backbuffer) {
+        /* GetBackBuffer(-1) is the frame Present last showed, and Present
+           refreshes it. As in the D3D11 presenter, the first read snapshots
+           this frame into it. */
+        const bool front = draw.texture_is_front_buffer;
+        SDL_GPUTexture *copy = front ? presenter->frontbuffer_copy : presenter->backbuffer_copy;
+        if (front && presenter->frontbuffer_used) return copy;
+        if (front) presenter->frontbuffer_used = true;
+        ensureBackbufferResolved(presenter);
+        SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+        SDL_GPUCopyPass *copypass = SDL_BeginGPUCopyPass(cmdbuf);
+        if (copypass) {
+            SDL_GPUTextureLocation src_loc{presenter->backbuffer_resolve, 0, 0, 0, 0};
+            SDL_GPUTextureLocation dst_loc{copy, 0, 0, 0, 0};
+            SDL_CopyGPUTextureToTexture(copypass, &src_loc, &dst_loc, mainWidth(presenter), mainHeight(presenter), 1, false);
+            SDL_EndGPUCopyPass(copypass);
+            if (presenter->copy_mips) SDL_GenerateMipmapsForGPUTexture(cmdbuf, copy);
+        }
+        return copy;
+    }
+    RenderTargetEntry *rt = findRenderTarget(presenter, desc);
+    if (rt && rt->texture) {
+        return rt->texture;
+    }
+
+    const bool palettized = desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_P8;
+    const bool linear_bgra = desc.format_byte == 0x12u;
+    const bool compressed = desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT1 ||
+                            desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT3 ||
+                            desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT5;
+    const uint32_t levels = compressed && desc.mip_levels ? desc.mip_levels : 1u;
+
+    /* The D3D11 presenter's size checks: a short guest view must not be read
+       past its end, nor uploaded from past the end of a transfer buffer. */
+    if (compressed) {
+        const uint32_t span = recomp_d3d_texture_compressed_mip_span(&desc);
+        if (span == 0u || span > draw.texture_byte_count) return nullptr;
+    }
+    if (linear_bgra && (!desc.linear || desc.depth || desc.bits_per_pixel != 32u ||
+        desc.pitch < desc.width * 4u || draw.texture_bytes == nullptr ||
+        static_cast<uint64_t>(desc.height - 1u) * desc.pitch + desc.width * 4u >
+            draw.texture_byte_count)) {
+        return nullptr;
+    }
+
+    if (palettized && (draw.palette_bytes == nullptr || draw.palette_byte_count != kPaletteBytes)) {
+        return nullptr;
+    }
+
+    const auto cached = presenter->texture_index.equal_range(desc.data);
+    const bool fingerprinted = !linear_bgra && draw.texture_bytes != nullptr;
+    const uint64_t fingerprint = fingerprinted
+        ? textureFingerprint(draw.texture_bytes, draw.texture_byte_count) : 0u;
+
+    for (auto it = cached.first; it != cached.second; ++it) {
+        TextureEntry &entry = presenter->textures[it->second];
+        if (entry.format_byte == desc.format_byte &&
+            entry.width == desc.width && entry.height == desc.height && entry.mip_levels == levels &&
+            (!palettized || std::memcmp(entry.palette, draw.palette_bytes, kPaletteBytes) == 0)) {
+            if (fingerprinted && entry.fingerprint != fingerprint) {
+                unindexTexture(presenter, it->second);
+                retireTexture(presenter, entry);
+                entry.used = false;
+                break;
+            }
+            if (linear_bgra && draw.texture_bytes != nullptr && draw.texture_byte_count > 0u) {
+                // Queued draws sampled the old contents; record them before the upload.
+                if (!presenter->segment.draws.empty()) flushSegment(presenter);
+                const uint32_t tbuf_size = desc.width * desc.height * 4u;
+                SDL_GPUTransferBufferCreateInfo tbuf_info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, tbuf_size, 0};
+                SDL_GPUTransferBuffer *tbuf = SDL_CreateGPUTransferBuffer(presenter->device, &tbuf_info);
+                if (tbuf) {
+                    void *map = SDL_MapGPUTransferBuffer(presenter->device, tbuf, false);
+                    if (map) {
+                        const auto *src = static_cast<const uint8_t *>(draw.texture_bytes);
+                        auto *dst = static_cast<uint8_t *>(map);
+                        for (uint32_t y = 0u; y < desc.height; ++y) {
+                            std::memcpy(dst + y * (desc.width * 4u), src + y * desc.pitch, desc.width * 4u);
+                        }
+                        SDL_UnmapGPUTransferBuffer(presenter->device, tbuf);
+                        SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+                        SDL_GPUCopyPass *cpass = SDL_BeginGPUCopyPass(cmdbuf);
+                        if (cpass) {
+                            SDL_GPUTextureTransferInfo src_info{tbuf, 0, desc.width, desc.height};
+                            SDL_GPUTextureRegion dst_reg{entry.texture, 0, 0, 0, 0, 0, desc.width, desc.height, 1};
+                            SDL_UploadToGPUTexture(cpass, &src_info, &dst_reg, false);
+                            SDL_EndGPUCopyPass(cpass);
+                        }
+                    }
+                    SDL_ReleaseGPUTransferBuffer(presenter->device, tbuf);
+                }
+            }
+            return entry.texture;
+        }
+    }
+
+    const bool expand_a8 = desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8 && !presenter->a8_supported;
+    const SDL_GPUTextureFormat format = (linear_bgra || expand_a8)
+        ? SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM : hostTextureFormat(desc.format_byte);
+    if (format == SDL_GPU_TEXTUREFORMAT_INVALID || draw.texture_bytes == nullptr ||
+        draw.texture_byte_count == 0u || (desc.linear && !linear_bgra)) {
+        return nullptr;
+    }
+
+    std::vector<uint8_t> unswizzled;
+    const void *upload_bytes = draw.texture_bytes;
+    uint32_t upload_size = draw.texture_byte_count;
+
+    if (linear_bgra) {
+        const size_t packed_size = static_cast<size_t>(desc.width) * desc.height * 4u;
+        unswizzled.resize(packed_size);
+        const auto *src = static_cast<const uint8_t *>(draw.texture_bytes);
+        for (uint32_t y = 0u; y < desc.height; ++y) {
+            std::memcpy(unswizzled.data() + y * (desc.width * 4u), src + y * desc.pitch, desc.width * 4u);
+        }
+        upload_bytes = unswizzled.data();
+        upload_size = static_cast<uint32_t>(packed_size);
+    } else if (palettized) {
+        const size_t texels = static_cast<size_t>(desc.width) * desc.height;
+        if (texels > draw.texture_byte_count) return nullptr;
+        std::vector<uint8_t> indices(texels);
+        if (!recomp_d3d_texture_unswizzle(
+                static_cast<const uint8_t *>(draw.texture_bytes),
+                indices.data(), desc.width, desc.height, 1u)) {
+            return nullptr;
+        }
+        unswizzled.resize(texels * 4u);
+        const auto *palette = static_cast<const uint8_t *>(draw.palette_bytes);
+        for (size_t i = 0u; i < texels; ++i) {
+            std::memcpy(unswizzled.data() + i * 4u, palette + indices[i] * 4u, 4u);
+        }
+        upload_bytes = unswizzled.data();
+        upload_size = static_cast<uint32_t>(unswizzled.size());
+    } else if (isSwizzledTextureFormat(desc.format_byte) && !desc.linear) {
+        const size_t texel_bytes = desc.bits_per_pixel / 8u;
+        unswizzled.resize(static_cast<size_t>(desc.width) * desc.height * texel_bytes);
+        if (!recomp_d3d_texture_unswizzle(
+                static_cast<const uint8_t *>(draw.texture_bytes),
+                unswizzled.data(), desc.width, desc.height, static_cast<uint32_t>(texel_bytes))) {
+            return nullptr;
+        }
+        if (expand_a8) {
+            // Fallback for Vulkan drivers without VK_KHR_maintenance5 (VK_FORMAT_A8_UNORM_KHR):
+            // expand A8 to BGRA8 (255, 255, 255, alpha) so shader .a reads match identically.
+            const size_t texels = static_cast<size_t>(desc.width) * desc.height;
+            std::vector<uint8_t> bgra(texels * 4u);
+            for (size_t i = 0u; i < texels; ++i) {
+                bgra[i * 4u + 0u] = 0xffu;
+                bgra[i * 4u + 1u] = 0xffu;
+                bgra[i * 4u + 2u] = 0xffu;
+                bgra[i * 4u + 3u] = unswizzled[i];
+            }
+            unswizzled = std::move(bgra);
+        }
+        upload_bytes = unswizzled.data();
+        upload_size = static_cast<uint32_t>(unswizzled.size());
+    }
+
+    SDL_GPUTextureCreateInfo tex_info{};
+    tex_info.type = SDL_GPU_TEXTURETYPE_2D;
+    tex_info.format = format;
+    tex_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    tex_info.width = desc.width;
+    tex_info.height = desc.height;
+    tex_info.layer_count_or_depth = 1;
+    tex_info.num_levels = levels;
+    SDL_GPUTexture *gpu_tex = SDL_CreateGPUTexture(presenter->device, &tex_info);
+    if (!gpu_tex) return nullptr;
+
+    SDL_GPUTransferBufferCreateInfo tbuf_info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, upload_size, 0};
+    SDL_GPUTransferBuffer *tbuf = SDL_CreateGPUTransferBuffer(presenter->device, &tbuf_info);
+    if (!tbuf) {
+        SDL_ReleaseGPUTexture(presenter->device, gpu_tex);
+        return nullptr;
+    }
+
+    void *map = SDL_MapGPUTransferBuffer(presenter->device, tbuf, false);
+    if (map) {
+        std::memcpy(map, upload_bytes, upload_size);
+        SDL_UnmapGPUTransferBuffer(presenter->device, tbuf);
+
+        SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+        SDL_GPUCopyPass *cpass = SDL_BeginGPUCopyPass(cmdbuf);
+        if (cpass) {
+            if (compressed) {
+                const uint32_t block_bytes = (desc.format_byte == RECOMP_D3D_TEXTURE_FORMAT_DXT1) ? 8u : 16u;
+                uint32_t cur_w = desc.width, cur_h = desc.height, cur_offset = 0u;
+                for (uint32_t lvl = 0; lvl < levels; ++lvl) {
+                    SDL_GPUTextureTransferInfo src_info{tbuf, cur_offset, 0, 0};
+                    SDL_GPUTextureRegion dst_reg{gpu_tex, lvl, 0, 0, 0, 0, cur_w, cur_h, 1};
+                    SDL_UploadToGPUTexture(cpass, &src_info, &dst_reg, false);
+
+                    uint32_t row_pitch = ((cur_w + 3u) / 4u) * block_bytes;
+                    cur_offset += row_pitch * ((cur_h + 3u) / 4u);
+                    cur_w = cur_w > 1u ? cur_w / 2u : 1u;
+                    cur_h = cur_h > 1u ? cur_h / 2u : 1u;
+                }
+            } else {
+                SDL_GPUTextureTransferInfo src_info{tbuf, 0, desc.width, desc.height};
+                SDL_GPUTextureRegion dst_reg{gpu_tex, 0, 0, 0, 0, 0, desc.width, desc.height, 1};
+                SDL_UploadToGPUTexture(cpass, &src_info, &dst_reg, false);
+            }
+            SDL_EndGPUCopyPass(cpass);
+        }
+    }
+    SDL_ReleaseGPUTransferBuffer(presenter->device, tbuf);
+
+    const uint32_t slot = presenter->next_texture_slot;
+    TextureEntry &entry = presenter->textures[slot];
+    if (entry.used) {
+        unindexTexture(presenter, slot);
+        retireTexture(presenter, entry);
+    }
+    entry.used = true;
+    entry.data = desc.data;
+    entry.format_byte = desc.format_byte;
+    entry.width = desc.width;
+    entry.height = desc.height;
+    entry.mip_levels = levels;
+    entry.fingerprint = fingerprint;
+    entry.texture = gpu_tex;
+    if (palettized) std::memcpy(entry.palette, draw.palette_bytes, kPaletteBytes);
+
+    presenter->texture_index.insert({desc.data, slot});
+    presenter->next_texture_slot = (presenter->next_texture_slot + 1u) % kTextureSlots;
+    if (presenter->texture_count < kTextureSlots) ++presenter->texture_count;
+    return gpu_tex;
+}
+
+std::string buildMslShader(const RecompD3dVertexLayout &layout, uint32_t fvf,
+                           uint32_t program_count, const uint32_t (*program_tokens)[4])
+{
+    const bool has_normal = layout.normal_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool has_diffuse = layout.diffuse_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool has_texcoord = layout.texcoord_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool four_coords = (layout.texcoord_count == 4u);
+    const bool two_coords = (layout.texcoord_count == 2u);
+
+    std::string s;
+    s.reserve(4096);
+    s += kMslShaderPrologue;
+
+    // VSIn
+    s += "struct VSIn {\n";
+    s += layout.pretransformed ? "    float4 position [[attribute(0)]];\n" : "    float3 position [[attribute(0)]];\n";
+    if (layout.blend_weight_count == 1u) {
+        s += "    float weights [[attribute(1)]];\n";
+    } else if (layout.blend_weight_count == 2u) {
+        s += "    float2 weights [[attribute(1)]];\n";
+    } else if (layout.blend_weight_count == 3u) {
+        s += "    float3 weights [[attribute(1)]];\n";
+    }
+    if (has_normal) s += "    float3 normal [[attribute(2)]];\n";
+    if (has_diffuse) s += "    float4 diffuse [[attribute(3)]];\n";
+    if (has_texcoord) s += "    float2 texcoord [[attribute(4)]];\n";
+    if (four_coords) {
+        s += "    float2 texcoord1 [[attribute(5)]];\n";
+        s += "    float2 texcoord2 [[attribute(6)]];\n";
+        s += "    float2 texcoord3 [[attribute(7)]];\n";
+    } else if (two_coords) {
+        s += "    float2 texcoord1 [[attribute(5)]];\n";
+    }
+    s += "};\n";
+
+    // VSOut
+    s += "struct VSOut {\n";
+    s += "    float4 position [[position]];\n";
+    s += "    float4 color [[user(col0)]];\n";
+    s += "    float2 texcoord [[user(uv0)]];\n";
+    s += "    float2 reflection_coord [[user(refl_uv)]];\n";
+    s += "    float3 lit_specular [[user(lit_spec)]];\n";
+    s += "    float fog [[user(fog)]];\n";
+    s += "    float3 water_pos [[user(water_pos)]];\n";
+    s += "    float2 water_tilt [[user(water_tilt)]];\n";
+    if (four_coords) {
+        s += "    float2 texcoord1 [[user(uv1)]];\n";
+        s += "    float2 texcoord2 [[user(uv2)]];\n";
+        s += "    float2 texcoord3 [[user(uv3)]];\n";
+    } else if (two_coords) {
+        s += "    float2 texcoord1 [[user(uv1)]];\n";
+    }
+    if (program_count) {
+        s += "    float2 program_q [[user(prog_q)]];\n";
+    }
+    s += "};\n";
+
+    // vs_main
+    s += program_count
+        ? "vertex VSOut vs_main(VSIn in [[stage_in]], constant TransformUniforms &u [[buffer(0)]],\n"
+          "                    constant ProgramConstants &pc [[buffer(1)]]) {\n"
+        : "vertex VSOut vs_main(VSIn in [[stage_in]], constant TransformUniforms &u [[buffer(0)]]) {\n";
+    s += "    VSOut out = {};\n";
+
+    bool has_prog = false;
+    if (program_count) {
+        std::string prog_body;
+        if (recomp_d3d_vertex_program_msl_source(program_tokens, program_count, prog_body)) {
+            s += prog_body;
+            s += "    return out;\n";
+            s += "}\n";
+            has_prog = true;
+        }
+        // Like the D3D11 presenter, skip a draw whose program does not translate.
+        if (!has_prog) return {};
+    }
+    if (!has_prog) {
+        if (layout.pretransformed) {
+            s += "    out.position = (u.wvp[0] * float4(in.position.xyz, 1.0)) / in.position.w;\n";
+        } else if (layout.blend_weight_count != 0u) {
+            s += "    if (u.blend_flags.x > 0.5) {\n";
+            s += "        float4 p = float4(0.0);\n";
+            s += "        float remainder = 1.0;\n";
+            if (layout.blend_weight_count == 1u) {
+                s += "        p += in.weights * (u.wvp[0] * float4(in.position, 1.0));\n";
+                s += "        remainder -= in.weights;\n";
+            } else {
+                for (uint32_t i = 0u; i < layout.blend_weight_count; ++i) {
+                    s += "        p += in.weights[" + std::to_string(i) + "] * (u.wvp[" + std::to_string(i) + "] * float4(in.position, 1.0));\n";
+                    s += "        remainder -= in.weights[" + std::to_string(i) + "];\n";
+                }
+            }
+            s += "        p += remainder * (u.wvp[" + std::to_string(layout.blend_weight_count) + "] * float4(in.position, 1.0));\n";
+            s += "        out.position = p;\n";
+            s += "    } else {\n";
+            s += "        out.position = u.wvp[0] * float4(in.position, 1.0);\n";
+            s += "    }\n";
+        } else {
+            s += "    out.position = u.wvp[0] * float4(in.position, 1.0);\n";
+        }
+
+        // Color & lighting
+        if (has_diffuse) {
+            s += "    out.color = in.diffuse.zyxw;\n";
+        } else if (has_normal && !layout.pretransformed) {
+            s += "    if (u.directional_flags.x > 0.5) {\n";
+            s += "        float3 n = (u.directional_normals[0] * float4(in.normal, 0.0)).xyz;\n";
+            s += "        float3 world_pos = (u.light_world[0] * float4(in.position, 1.0)).xyz;\n";
+            if (layout.blend_weight_count != 0u) {
+                s += "        if (u.blend_flags.x > 0.5) {\n";
+                s += "            n = float3(0.0);\n";
+                s += "            world_pos = float3(0.0);\n";
+                s += "            float remainder = 1.0;\n";
+                if (layout.blend_weight_count == 1u) {
+                    s += "            n += in.weights * (u.directional_normals[0] * float4(in.normal, 0.0)).xyz;\n";
+                    s += "            world_pos += in.weights * (u.light_world[0] * float4(in.position, 1.0)).xyz;\n";
+                    s += "            remainder -= in.weights;\n";
+                } else {
+                    for (uint32_t i = 0u; i < layout.blend_weight_count; ++i) {
+                        s += "            n += in.weights[" + std::to_string(i) + "] * (u.directional_normals[" + std::to_string(i) + "] * float4(in.normal, 0.0)).xyz;\n";
+                        s += "            world_pos += in.weights[" + std::to_string(i) + "] * (u.light_world[" + std::to_string(i) + "] * float4(in.position, 1.0)).xyz;\n";
+                        s += "            remainder -= in.weights[" + std::to_string(i) + "];\n";
+                    }
+                }
+                s += "            n += remainder * (u.directional_normals[" + std::to_string(layout.blend_weight_count) + "] * float4(in.normal, 0.0)).xyz;\n";
+                s += "            world_pos += remainder * (u.light_world[" + std::to_string(layout.blend_weight_count) + "] * float4(in.position, 1.0)).xyz;\n";
+                s += "        }\n";
+            }
+            s += "        if (u.directional_flags.y > 0.5 && dot(n, n) > 0.0) n = normalize(n);\n";
+            s += "        float3 rgb = u.directional_base.rgb;\n";
+            s += "        float3 spec = float3(0.0);\n";
+            s += "        uint light_cnt = uint(u.directional_flags.z);\n";
+            s += "        for (uint i = 0; i < light_cnt; ++i) {\n";
+            s += "            float3 l = u.directional_directions[i].xyz;\n";
+            s += "            float atten = 1.0;\n";
+            s += "            if (u.light_positions[i].w > 0.5) {\n";
+            s += "                l = u.light_positions[i].xyz - world_pos;\n";
+            s += "                float d = length(l);\n";
+            s += "                float denominator = dot(u.light_attenuation[i].xyz, float3(1.0, d, d * d));\n";
+            s += "                atten = (d <= u.light_attenuation[i].w && denominator > 0.0) ? 1.0 / denominator : 0.0;\n";
+            s += "                l = d > 0.0 ? l / d : float3(0.0);\n";
+            s += "            }\n";
+            s += "            float ndotl = dot(n, l);\n";
+            s += "            rgb += (u.directional_material.rgb * u.directional_colors[i].rgb * max(0.0, ndotl) + u.light_ambient[i].rgb) * atten;\n";
+            s += "            if (u.light_view.w > 0.0 && ndotl > 0.0)\n";
+            s += "                spec += atten * u.light_specular[i].rgb * pow(max(dot(n, normalize(l + u.light_view.xyz)), 1e-6), u.light_view.w);\n";
+            s += "        }\n";
+            s += "        out.color = float4(saturate(rgb), 1.0);\n";
+            s += "        if (u.directional_flags.w > 0.5) out.color.a = u.directional_material.a;\n";
+            s += "        out.lit_specular = saturate(spec);\n";
+            s += "    } else {\n";
+            s += "        out.color = float4(abs(normalize(in.normal)), 1.0);\n";
+            s += "    }\n";
+        } else {
+            s += "    out.color = float4(0.75, 0.75, 0.78, 1.0);\n";
+        }
+
+        s += has_texcoord ? "    out.texcoord = in.texcoord;\n" : "    out.texcoord = float2(0.0);\n";
+        if (four_coords) {
+            s += "    out.texcoord1 = in.texcoord1;\n";
+            s += "    out.texcoord2 = in.texcoord2;\n";
+            s += "    out.texcoord3 = in.texcoord3;\n";
+        } else if (two_coords) {
+            s += "    out.texcoord1 = in.texcoord1;\n";
+        }
+
+        s += "    out.reflection_coord = float2(0.0);\n";
+        /* Modern water's world position and, from normals that point up, the
+           game's own ripple tilt. The Forest creek's edge strip carries
+           sideways normals that made its texgen reflection jump (the seam
+           between creek tiles), so they are dropped. */
+        if (has_texcoord && !layout.pretransformed) {
+            s += "    out.water_pos = (u.water_world * float4(in.position, 1.0)).xyz;\n";
+            if (has_normal) {
+                s += "    float3 water_normal = in.normal.x * u.water_world[0].xyz / dot(u.water_world[0].xyz, u.water_world[0].xyz)\n";
+                s += "        + in.normal.y * u.water_world[1].xyz / dot(u.water_world[1].xyz, u.water_world[1].xyz)\n";
+                s += "        + in.normal.z * u.water_world[2].xyz / dot(u.water_world[2].xyz, u.water_world[2].xyz);\n";
+                s += "    if (in.normal.y > 0.5 && water_normal.y > 0.0) out.water_tilt = water_normal.xz / water_normal.y;\n";
+            }
+        }
+        if (has_texcoord && !layout.pretransformed) {
+            if (has_normal) {
+                s += "    if (u.reflection_flags.x == 2.0) {\n";
+                s += "        out.reflection_coord = in.texcoord;\n";
+                s += "    } else if (u.reflection_flags.x > 0.5) {\n";
+                s += "        float3 eye = (u.reflection_world_view * float4(in.position, 1.0)).xyz;\n";
+                s += "        float3 n = (u.reflection_normal * float4(in.normal, 0.0)).xyz;\n";
+                s += "        if (u.reflection_flags.y > 0.5) n = normalize(n);\n";
+                s += "        float3 r = reflect(normalize(eye), n);\n";
+                s += "        float2 coord = (u.reflection_transform * float4(r, 1.0)).xy;\n";
+                s += "        if (u.reflection_flags.x == 3.0) {\n";
+                s += "            out.reflection_coord = in.texcoord;\n";
+                s += "            out.texcoord = coord;\n";
+                s += "        } else out.reflection_coord = coord;\n";
+                s += "    }\n";
+            } else {
+                s += "    if (u.reflection_flags.x > 1.5) {\n";
+                s += "        out.reflection_coord = in.texcoord;\n";
+                s += "    } else if (u.reflection_flags.x > 0.5) {\n";
+                s += "        float3 eye = (u.reflection_world_view * float4(in.position, 1.0)).xyz;\n";
+                s += "        float3 r = normalize(eye);\n";
+                s += "        out.reflection_coord = (u.reflection_transform * float4(r, 1.0)).xy;\n";
+                s += "    }\n";
+            }
+        }
+        /* D3D8 table fog from clip w, as the D3D11 presenter computes it: mode 1
+           linear (y = end, z = 1/(end-start)), 2 exp and 3 exp2 (y = density). */
+        s += "    if (u.fog_params.x > 0.5) {\n";
+        s += "        float d = max(out.position.w, 0.0);\n";
+        s += "        float f = u.fog_params.x < 1.5 ? (u.fog_params.y - d) * u.fog_params.z\n";
+        s += "            : u.fog_params.x < 2.5 ? exp(-d * u.fog_params.y)\n";
+        s += "            : exp(-d * d * u.fog_params.y * u.fog_params.y);\n";
+        s += "        out.fog = saturate(f);\n";
+        s += "    }\n";
+        s += "    return out;\n";
+        s += "}\n";
+    }
+
+    // ps_main
+    s += "fragment float4 ps_main(VSOut in [[stage_in]],\n";
+    s += "                        constant TransformUniforms &u [[buffer(0)]],\n";
+    s += "                        texture2d<float> guest_texture [[texture(0)]],\n";
+    s += "                        sampler guest_sampler [[sampler(0)]],\n";
+    s += "                        texture2d<float> alpha_mask [[texture(1)]],\n";
+    s += "                        sampler mask_sampler [[sampler(1)]],\n";
+    s += "                        texture2d<float> scene_color [[texture(2)]],\n";
+    s += "                        sampler scene_sampler [[sampler(2)]],\n";
+    s += "                        depth2d<float> scene_depth [[texture(3)]]) {\n";
+    if (program_count) {
+        s += "    in.texcoord /= in.program_q.x;\n";
+        s += "    if (u.reflection_flags.z > 0.5) in.reflection_coord /= in.program_q.y;\n";
+    }
+    s += "    float4 shaded = in.color;\n";
+    s += "    float water_fresnel = 0.0, water_crest = 0.0;\n";
+    s += "    float3 water_n = float3(0.0, 1.0, 0.0), water_v = float3(0.0, 1.0, 0.0), water_spec = float3(0.0), water_scatter = float3(0.0);\n";
+    s += "    float water_footprint = length(fwidth(in.water_pos.xz));\n";
+    s += "    if (u.water_sun.w > 0.5) {\n";
+    s += "        bool sea = u.water_sun.w > 1.5;\n";
+    s += "        float4 w = water_surface(in.water_pos.xz, u.water_eye.w, water_footprint, u.water_flow.xy,\n";
+    s += "            sea ? 1.6 : 7.0, sea ? 0.05 : 0.03);\n";
+    s += "        w.xy -= in.water_tilt;\n";
+    s += "        water_n = normalize(float3(-w.x, 1.0, -w.y));\n";
+    s += "        water_v = normalize(u.water_eye.xyz - in.water_pos);\n";
+    s += "        float3 hv = normalize(water_v + u.water_sun.xyz);\n";
+    s += "        float nv = max(dot(water_n, water_v), 0.001), nh = saturate(dot(water_n, hv));\n";
+    s += "        water_fresnel = 0.02 + 0.98 * pow(1.0 - nv, 5.0);\n";
+    s += "        float a2 = 0.002 + 2.0 * w.w, dn = nh * nh * (a2 - 1.0) + 1.0;\n";
+    s += "        float sun_fresnel = 0.02 + 0.98 * pow(1.0 - saturate(dot(water_v, hv)), 5.0);\n";
+    s += "        water_spec = u.water_sun_color.rgb * (4.0 * a2 / (3.14159 * dn * dn) * sun_fresnel *\n";
+    s += "            saturate(dot(water_n, u.water_sun.xyz)) / (4.0 * nv));\n";
+    s += "        if (u.fog_params.x > 0.5) water_spec *= in.fog;\n";
+    s += "        float back = pow(saturate(dot(normalize(-water_v.xz + 0.0001), normalize(u.water_sun.xz + 0.0001))), 4.0);\n";
+    s += "        water_crest = saturate(w.z);\n";
+    s += "        water_scatter = u.water_sun_color.rgb * (water_crest * water_crest * (0.3 + 0.7 * back));\n";
+    s += "        float3 r = (u.water_view * float4(reflect(-water_v, water_n), 0.0)).xyz;\n";
+    s += "        in.texcoord = (u.reflection_transform * float4(r, 1.0)).xy;\n";
+    s += "    }\n";
+    s += "    if (u.reflection_flags.x > 0.5 && u.reflection_flags.x < 2.5) {\n";
+    s += "        float4 base = guest_texture.sample(guest_sampler, in.texcoord);\n";
+    s += "        base.a *= u.reflection_diffuse.a;\n";
+    s += "        float4 env = alpha_mask.sample(guest_sampler, in.reflection_coord);\n";
+    s += "        float4 diffuse = u.reflection_diffuse;\n";
+    s += "        if (u.directional_flags.x > 0.5) diffuse.rgb = in.color.rgb;\n";
+    s += "        shaded = mix(base, env, env.a) * diffuse;\n";
+    s += "    } else\n";
+    if (four_coords) {
+        s += "    if (u.texture_flags.z > 0.5) {\n";
+        s += "        float4 t0 = guest_texture.sample(guest_sampler, in.texcoord * u.texture_flags.xy);\n";
+        s += "        float4 t1 = guest_texture.sample(guest_sampler, in.texcoord1 * u.texture_flags.xy);\n";
+        s += "        float4 t2 = guest_texture.sample(guest_sampler, in.texcoord2 * u.texture_flags.xy);\n";
+        s += "        float4 t3 = guest_texture.sample(guest_sampler, in.texcoord3 * u.texture_flags.xy);\n";
+        s += "        shaded = 0.5 * (saturate((128.0 / 255.0) * (t0 + t1)) + saturate((128.0 / 255.0) * (t2 + t3)));\n";
+        s += "    } else\n";
+    } else if (two_coords) {
+        s += "    if (u.texture_flags.w > 0.5) {\n";
+        s += "        float3 rgb = guest_texture.sample(guest_sampler, in.texcoord1 * u.texture_flags.xy).rgb;\n";
+        s += "        float alpha = alpha_mask.sample(mask_sampler, in.texcoord * u.lighting_flags.zw).a;\n";
+        s += "        shaded = in.color * float4(rgb, alpha);\n";
+        s += "    } else\n";
+    }
+    s += "    if (u.blend_flags.y == 1.0) {\n";
+    s += "        shaded = u.texture_factor;\n";
+    s += "    } else if (u.draw_flags.x > 0.5) {\n";
+    s += "        float4 sampled = guest_texture.sample(guest_sampler,\n";
+    s += "            clamp(in.texcoord, u.texcoord_clamp.xy, u.texcoord_clamp.zw) * u.texture_flags.xy);\n";
+    s += "        if (u.lighting_flags.y > 0.5) sampled.rgb = float3(1.0);\n";
+    s += has_diffuse ? "        shaded *= sampled;\n" : "        shaded = sampled;\n";
+    // Stage 0 combines the texture and lit diffuse as the guest's color and alpha ops select.
+    s += "        if (u.directional_flags.w > 0.5) {\n";
+    s += "            shaded.rgb = (u.light_stage.x > 0.5 ? sampled.rgb : float3(1.0)) *\n";
+    s += "                (u.light_stage.y > 0.5 ? in.color.rgb : float3(1.0)) *\n";
+    s += "                (u.light_stage.y > 1.5 ? in.color.rgb : float3(1.0));\n";
+    s += "            shaded.a = (u.light_stage.z > 0.5 ? sampled.a : 1.0) *\n";
+    s += "                (u.light_stage.w > 0.5 ? in.color.a : 1.0) *\n";
+    s += "                (u.light_stage.w > 1.5 ? in.color.a : 1.0);\n";
+    s += "        } else if (u.directional_flags.x > 0.5) shaded.rgb *= in.color.rgb;\n";
+    s += "        if (u.lighting_flags.x > 0.5) shaded.rgb = float3(0.0);\n";
+    s += "        shaded.a = (u.blend_flags.w > 0.5) ? u.blend_flags.z : (shaded.a * u.blend_flags.z);\n";
+    s += "        if (u.blend_flags.y > 1.5) shaded *= u.texture_factor;\n";
+    s += "    } else if (u.directional_flags.w > 0.5) {\n";
+    s += "        if (u.light_stage.y > 1.5) shaded.rgb *= in.color.rgb;\n";
+    s += "        if (u.light_stage.w > 1.5) shaded.a *= in.color.a;\n";
+    s += "    }\n";
+    // Fixed function adds specular after the texture stages, textured or not.
+    s += "    if (u.directional_flags.w > 0.5) shaded.rgb += in.lit_specular;\n";
+    s += "    if (u.fog_params.x > 0.5) shaded.rgb = mix(u.fog_color.rgb, shaded.rgb, in.fog);\n";
+    s += "    if (u.reflection_flags.z > 1.5) {\n";
+    s += "        shaded.a *= alpha_mask.sample(mask_sampler, in.reflection_coord).a;\n";
+    s += "    } else if (u.reflection_flags.z > 0.5) {\n";
+    s += "        shaded.a *= alpha_mask.sample(mask_sampler, in.reflection_coord, bias(u.reflection_flags.w)).a;\n";
+    s += "    }\n";
+    s += "    if (u.draw_flags.y > 0.5) {\n";
+    s += "        float alpha = round(saturate(shaded.a) * 255.0);\n";
+    s += "        float ref = u.draw_flags.w;\n";
+    s += "        int func = int(u.draw_flags.z);\n";
+    s += "        bool alpha_pass = (func == 7) ||\n";
+    s += "            (func == 1 && alpha < ref) ||\n";
+    s += "            (func == 2 && alpha == ref) ||\n";
+    s += "            (func == 3 && alpha <= ref) ||\n";
+    s += "            (func == 4 && alpha > ref) ||\n";
+    s += "            (func == 5 && alpha != ref) ||\n";
+    s += "            (func == 6 && alpha >= ref);\n";
+    s += "        if (!alpha_pass) discard_fragment();\n";
+    s += "    }\n";
+    s += "    if (u.water_sun.w > 0.5) {\n";
+    s += "        bool sea = u.water_sun.w > 1.5, film = u.water_sun.w > 2.5 && u.water_sun.w < 3.5;\n";
+    s += "        float cover = film ? saturate(in.color.a * 3.0) : u.water_sun.w > 3.5 ?\n";
+    s += "            saturate((in.color.a - 0.2) * 5.0) : sea ? 1.0 : saturate(shaded.a);\n";
+    s += "        float3 r = reflect(-water_v, water_n);\n";
+    s += "        r = normalize(float3(r.x, max(r.y, 0.02), r.z));\n";
+    s += "        float3 sky = mix(u.water_sky.rgb, u.water_sky.rgb * float3(0.55, 0.7, 1.0), saturate(r.y));\n";
+    s += "        float3 mirror = sea ? sky : shaded.rgb * 0.9;\n";
+    s += "        float3 absorb = sea ? float3(0.9, 0.16, 0.11) : float3(1.2, 0.55, 0.7);\n";
+    s += "        float3 body = dot(u.water_sky.rgb, float3(0.333)) * (sea ? float3(0.02, 0.3, 0.34) : float3(0.02, 0.05, 0.04));\n";
+    s += "        float3 under = body;\n";
+    s += "        float depth = 10.0, opacity = 0.5 + 0.5 * water_fresnel;\n";
+    s += "        if (u.water_scene.x > 0.5) {\n";
+    s += "            float2 uv = in.position.xy * u.water_flow.zw;\n";
+    s += "            float3 bed = water_world_at(uv, water_depth_at(uv, u, scene_depth), u);\n";
+    s += "            depth = film ? 0.02 + 0.12 * cover : in.water_pos.y - bed.y;\n";
+    s += "            float2 bent = uv + water_n.xz * 0.03 * saturate(depth);\n";
+    s += "            float3 bent_bed = water_world_at(bent, water_depth_at(bent, u, scene_depth), u);\n";
+    s += "            if (!film && bent_bed.y > in.water_pos.y) { bent = uv; bent_bed = bed; }\n";
+    s += "            float3 bed_color = scene_color.sample(scene_sampler, bent, level(0.0)).rgb;\n";
+    s += "            if (sea) bed_color *= 1.0 + 1.5 * water_caustic(bent_bed.xz, u.water_eye.w) *\n";
+    s += "                exp(-1.5 * depth) * u.water_sun_color.rgb * saturate(2.0 * u.water_sun.y);\n";
+    s += "            float3 through = exp(-absorb * (film ? depth / max(water_v.y, 0.1) : distance(bent_bed, in.water_pos)));\n";
+    s += "            under = bed_color * through + body * (1.0 - through);\n";
+    s += "            float hit;\n";
+    s += "            float3 traced = water_trace(in.water_pos, r, in.position.xy, hit, u, scene_color, scene_sampler, scene_depth);\n";
+    s += "            mirror = mix(mirror, traced, hit);\n";
+    s += "            opacity = 1.0;\n";
+    s += "        }\n";
+    s += "        float reflectance = max(water_fresnel, sea ? 0.04 : 0.55);\n";
+    s += "        float3 color = mix(under + body * water_scatter * 3.0, mirror, reflectance) + water_spec;\n";
+    s += "        float foam = film || u.water_sun.w > 3.5\n";
+    s += "            ? saturate(1.0 - cover / 0.3) * saturate(cover / 0.05) * saturate(0.3 + water_crest)\n";
+    s += "            : saturate(1.0 - depth / 0.06) * saturate(0.4 + water_crest);\n";
+    s += "        color = mix(color, dot(u.water_sky.rgb, float3(0.333)) * 1.1 + 0.2 * u.water_sun_color.rgb, 0.8 * foam);\n";
+    s += "        float alpha = cover * max(opacity * saturate(depth / 0.02), 0.8 * foam);\n";
+    s += "        shaded = float4(color * alpha, alpha);\n";
+    s += "    }\n";
+    s += "    return shaded;\n";
+    s += "}\n";
+
+    return s;
+}
+
+static const char kGlslUniformsVertex[] = R"(
+layout(set = 1, binding = 0, std140) uniform TransformUniforms {
+    mat4 wvp[4];
+    vec4 draw_flags;
+    vec4 blend_flags;
+    vec4 texture_factor;
+    vec4 lighting_flags;
+    vec4 texture_flags;
+    mat4 reflection_world_view;
+    mat4 reflection_normal;
+    mat4 reflection_transform;
+    vec4 reflection_diffuse;
+    vec4 reflection_flags;
+    vec4 directional_flags;
+    vec4 light_stage;
+    mat4 water_world;
+    vec4 water_eye;
+    vec4 water_sun;
+    vec4 water_sky;
+    mat4 water_view_proj;
+    mat4 water_inv_view_proj;
+    mat4 water_view;
+    vec4 water_flow;
+    vec4 water_scene;
+    vec4 water_sun_color;
+    vec4 fog_params;
+    vec4 fog_color;
+    vec4 texcoord_clamp;
+    mat4 directional_normals[4];
+    vec4 directional_base;
+    vec4 directional_material;
+    vec4 directional_directions[8];
+    vec4 directional_colors[8];
+    mat4 light_world[4];
+    vec4 light_positions[8];
+    vec4 light_attenuation[8];
+    vec4 light_ambient[8];
+    vec4 light_specular[8];
+    vec4 light_view;
+} u;
+)";
+
+static const char kGlslUniformsFragment[] = R"(
+layout(set = 3, binding = 0, std140) uniform TransformUniforms {
+    mat4 wvp[4];
+    vec4 draw_flags;
+    vec4 blend_flags;
+    vec4 texture_factor;
+    vec4 lighting_flags;
+    vec4 texture_flags;
+    mat4 reflection_world_view;
+    mat4 reflection_normal;
+    mat4 reflection_transform;
+    vec4 reflection_diffuse;
+    vec4 reflection_flags;
+    vec4 directional_flags;
+    vec4 light_stage;
+    mat4 water_world;
+    vec4 water_eye;
+    vec4 water_sun;
+    vec4 water_sky;
+    mat4 water_view_proj;
+    mat4 water_inv_view_proj;
+    mat4 water_view;
+    vec4 water_flow;
+    vec4 water_scene;
+    vec4 water_sun_color;
+    vec4 fog_params;
+    vec4 fog_color;
+    vec4 texcoord_clamp;
+    mat4 directional_normals[4];
+    vec4 directional_base;
+    vec4 directional_material;
+    vec4 directional_directions[8];
+    vec4 directional_colors[8];
+    mat4 light_world[4];
+    vec4 light_positions[8];
+    vec4 light_attenuation[8];
+    vec4 light_ambient[8];
+    vec4 light_specular[8];
+    vec4 light_view;
+} u;
+
+layout(set = 2, binding = 2) uniform sampler2D scene_color;
+layout(set = 2, binding = 3) uniform sampler2D scene_depth;
+
+// Modern water, as in the D3D11 presenter: eight sharp-crested travelling waves advected by a current
+// (slope, crest height and the variance of waves too fine for the pixel), Dave Hoskins' tileable
+// caustic, and a reflected ray marched through the scene depth.
+vec4 water_surface(vec2 p, float t, float footprint, vec2 flow, float k, float a) {
+    vec2 g = vec2(0.0);
+    float h = 0.0, variance = 0.0, a0 = a;
+    bool current = dot(flow, flow) > 0.0;
+    float base = current ? atan(flow.y, flow.x) : 0.0, spread = current ? 0.9 : 3.14159;
+    for (int i = 0; i < 8; ++i) {
+        float angle = base + spread * sin(2.39996 * float(i) + 0.4);
+        vec2 d = vec2(cos(angle), sin(angle));
+        float fade = clamp(1.5 - k * footprint, 0.0, 1.0);
+        float x = k * dot(d, p - flow * t) + 0.8 * sqrt(k) * t;
+        float s = exp(sin(x) - 1.0);
+        h += a * s * fade;
+        g += (a * k * s * cos(x) * fade) * d;
+        variance += 0.25 * a * a * k * k * (1.0 - fade * fade);
+        k *= 1.31; a *= 0.72;
+    }
+    return vec4(g, h / (3.6 * a0), variance);
+}
+float water_caustic(vec2 xz, float t) {
+    vec2 p = fract(xz * 0.3) * 6.28318 - 250.0, i = p;
+    float c = 1.0;
+    for (int n = 0; n < 4; ++n) {
+        float tt = t * (1.0 - 3.5 / float(n + 1));
+        i = p + vec2(cos(tt - i.x) + sin(tt + i.y), sin(tt - i.y) + cos(tt + i.x));
+        c += 1.0 / length(vec2(p.x / (sin(i.x + tt) / 0.005), p.y / (cos(i.y + tt) / 0.005)));
+    }
+    c = 1.17 - pow(c / 4.0, 1.4);
+    return clamp(pow(abs(c), 8.0), 0.0, 1.0);
+}
+float water_depth_at(vec2 uv) {
+    ivec2 size = ivec2(round(1.0 / u.water_flow.zw));
+    return texelFetch(scene_depth, clamp(ivec2(uv * vec2(size)), ivec2(0), size - 1), 0).r;
+}
+vec3 water_world_at(vec2 uv, float d) {
+    vec4 w = u.water_inv_view_proj * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    return w.xyz / w.w;
+}
+vec2 water_project(vec3 p, out float z) {
+    vec4 c = u.water_view_proj * vec4(p, 1.0);
+    z = c.w > 0.0 ? c.z / c.w : -1.0;
+    return vec2(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+}
+vec3 water_trace(vec3 p, vec3 r, vec2 pixel, out float hit) {
+    hit = 0.0;
+    float stride = 0.06, travelled = stride * fract(52.9829 * fract(dot(pixel, vec2(0.06711, 0.00584))));
+    vec3 last = p;
+    for (int i = 0; i < 24; ++i) {
+        vec3 q = p + r * travelled;
+        float z; vec2 uv = water_project(q, z);
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))) || z < 0.0 || z > 1.0) break;
+        float scene = water_depth_at(uv);
+        vec3 seen = water_world_at(uv, scene);
+        // The scene depth holds the bed under the water; a hit there is not a reflection.
+        if (z > scene && seen.y > p.y - 0.02 && distance(seen, q) < 2.0 * stride + 0.05) {
+            vec3 a = last, b = q;
+            for (int j = 0; j < 4; ++j) {
+                vec3 m = 0.5 * (a + b); float mz; vec2 muv = water_project(m, mz);
+                if (mz > water_depth_at(muv)) b = m; else a = m;
+            }
+            uv = water_project(b, z);
+            vec2 edge = clamp((0.5 - abs(uv - 0.5)) * 12.0, 0.0, 1.0);
+            hit = edge.x * edge.y;
+            return textureLod(scene_color, uv, 0.0).rgb;
+        }
+        last = q; travelled += stride; stride *= 1.25;
+    }
+    return vec3(0.0);
+}
+)";
+
+std::string buildGlslVertexShader(const RecompD3dVertexLayout &layout, uint32_t fvf,
+                                  uint32_t program_count, const uint32_t (*program_tokens)[4])
+{
+    const bool has_normal = layout.normal_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool has_diffuse = layout.diffuse_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool has_texcoord = layout.texcoord_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool four_coords = (layout.texcoord_count == 4u);
+    const bool two_coords = (layout.texcoord_count == 2u);
+
+    std::string s;
+    s.reserve(4096);
+    s += "#version 450\n";
+    s += kGlslUniformsVertex;
+    if (program_count) {
+        s += "layout(set = 1, binding = 1, std140) uniform ProgramConstants { vec4 vc[192]; } pc;\n";
+    }
+
+    if (layout.pretransformed) {
+        s += "layout(location = 0) in vec4 in_position;\n";
+    } else {
+        s += "layout(location = 0) in vec3 in_position;\n";
+    }
+
+    if (layout.blend_weight_count == 1u) {
+        s += "layout(location = 1) in float in_weights;\n";
+    } else if (layout.blend_weight_count == 2u) {
+        s += "layout(location = 1) in vec2 in_weights;\n";
+    } else if (layout.blend_weight_count == 3u) {
+        s += "layout(location = 1) in vec3 in_weights;\n";
+    }
+
+    if (has_normal) s += "layout(location = 2) in vec3 in_normal;\n";
+    if (has_diffuse) s += "layout(location = 3) in vec4 in_diffuse;\n";
+    if (has_texcoord) s += "layout(location = 4) in vec2 in_texcoord;\n";
+    if (four_coords) {
+        s += "layout(location = 5) in vec2 in_texcoord1;\n";
+        s += "layout(location = 6) in vec2 in_texcoord2;\n";
+        s += "layout(location = 7) in vec2 in_texcoord3;\n";
+    } else if (two_coords) {
+        s += "layout(location = 5) in vec2 in_texcoord1;\n";
+    }
+
+    s += "layout(location = 0) out vec4 v_color;\n";
+    s += "layout(location = 1) out vec2 v_texcoord;\n";
+    s += "layout(location = 2) out vec2 v_reflection_coord;\n";
+    if (four_coords) {
+        s += "layout(location = 3) out vec2 v_texcoord1;\n";
+        s += "layout(location = 4) out vec2 v_texcoord2;\n";
+        s += "layout(location = 5) out vec2 v_texcoord3;\n";
+    } else if (two_coords) {
+        s += "layout(location = 3) out vec2 v_texcoord1;\n";
+    }
+    if (program_count) {
+        s += "layout(location = 6) out vec2 v_program_q;\n";
+    }
+    s += "layout(location = 7) out vec3 v_lit_specular;\n";
+    s += "layout(location = 8) out float v_fog;\n";
+    s += "layout(location = 9) out vec3 v_water_pos;\n";
+    s += "layout(location = 10) out vec2 v_water_tilt;\n";
+
+    s += "void main() {\n";
+    s += "    v_lit_specular = vec3(0.0);\n";
+    s += "    v_fog = 1.0;\n";
+    s += "    v_water_pos = vec3(0.0);\n";
+    s += "    v_water_tilt = vec2(0.0);\n";
+
+    bool has_prog = false;
+    if (program_count) {
+        std::string prog_body;
+        if (recomp_d3d_vertex_program_glsl_source(program_tokens, program_count, prog_body)) {
+            s += prog_body;
+            s += "}\n";
+            has_prog = true;
+        }
+        // Like the D3D11 presenter, skip a draw whose program does not translate.
+        if (!has_prog) return {};
+    }
+
+    if (!has_prog) {
+        if (layout.pretransformed) {
+            s += "    gl_Position = (u.wvp[0] * vec4(in_position.xyz, 1.0)) / in_position.w;\n";
+        } else if (layout.blend_weight_count != 0u) {
+            s += "    if (u.blend_flags.x > 0.5) {\n";
+            s += "        vec4 p = vec4(0.0);\n";
+            s += "        float remainder = 1.0;\n";
+            if (layout.blend_weight_count == 1u) {
+                s += "        p += in_weights * (u.wvp[0] * vec4(in_position, 1.0));\n";
+                s += "        remainder -= in_weights;\n";
+            } else {
+                for (uint32_t i = 0u; i < layout.blend_weight_count; ++i) {
+                    s += "        p += in_weights[" + std::to_string(i) + "] * (u.wvp[" + std::to_string(i) + "] * vec4(in_position, 1.0));\n";
+                    s += "        remainder -= in_weights[" + std::to_string(i) + "];\n";
+                }
+            }
+            s += "        p += remainder * (u.wvp[" + std::to_string(layout.blend_weight_count) + "] * vec4(in_position, 1.0));\n";
+            s += "        gl_Position = p;\n";
+            s += "    } else {\n";
+            s += "        gl_Position = u.wvp[0] * vec4(in_position, 1.0);\n";
+            s += "    }\n";
+        } else {
+            s += "    gl_Position = u.wvp[0] * vec4(in_position, 1.0);\n";
+        }
+
+        // Color & lighting
+        if (has_diffuse) {
+            s += "    v_color = in_diffuse.zyxw;\n";
+        } else if (has_normal && !layout.pretransformed) {
+            s += "    if (u.directional_flags.x > 0.5) {\n";
+            s += "        vec3 n = (u.directional_normals[0] * vec4(in_normal, 0.0)).xyz;\n";
+            s += "        vec3 world_pos = (u.light_world[0] * vec4(in_position, 1.0)).xyz;\n";
+            if (layout.blend_weight_count != 0u) {
+                s += "        if (u.blend_flags.x > 0.5) {\n";
+                s += "            n = vec3(0.0);\n";
+                s += "            world_pos = vec3(0.0);\n";
+                s += "            float remainder = 1.0;\n";
+                if (layout.blend_weight_count == 1u) {
+                    s += "            n += in_weights * (u.directional_normals[0] * vec4(in_normal, 0.0)).xyz;\n";
+                    s += "            world_pos += in_weights * (u.light_world[0] * vec4(in_position, 1.0)).xyz;\n";
+                    s += "            remainder -= in_weights;\n";
+                } else {
+                    for (uint32_t i = 0u; i < layout.blend_weight_count; ++i) {
+                        s += "            n += in_weights[" + std::to_string(i) + "] * (u.directional_normals[" + std::to_string(i) + "] * vec4(in_normal, 0.0)).xyz;\n";
+                        s += "            world_pos += in_weights[" + std::to_string(i) + "] * (u.light_world[" + std::to_string(i) + "] * vec4(in_position, 1.0)).xyz;\n";
+                        s += "            remainder -= in_weights[" + std::to_string(i) + "];\n";
+                    }
+                }
+                s += "            n += remainder * (u.directional_normals[" + std::to_string(layout.blend_weight_count) + "] * vec4(in_normal, 0.0)).xyz;\n";
+                s += "            world_pos += remainder * (u.light_world[" + std::to_string(layout.blend_weight_count) + "] * vec4(in_position, 1.0)).xyz;\n";
+                s += "        }\n";
+            }
+            s += "        if (u.directional_flags.y > 0.5 && dot(n, n) > 0.0) n = normalize(n);\n";
+            s += "        vec3 rgb = u.directional_base.rgb;\n";
+            s += "        vec3 spec = vec3(0.0);\n";
+            s += "        uint light_cnt = uint(u.directional_flags.z);\n";
+            s += "        for (uint i = 0u; i < light_cnt; ++i) {\n";
+            s += "            vec3 l = u.directional_directions[i].xyz;\n";
+            s += "            float atten = 1.0;\n";
+            s += "            if (u.light_positions[i].w > 0.5) {\n";
+            s += "                l = u.light_positions[i].xyz - world_pos;\n";
+            s += "                float d = length(l);\n";
+            s += "                float denominator = dot(u.light_attenuation[i].xyz, vec3(1.0, d, d * d));\n";
+            s += "                atten = (d <= u.light_attenuation[i].w && denominator > 0.0) ? 1.0 / denominator : 0.0;\n";
+            s += "                l = d > 0.0 ? l / d : vec3(0.0);\n";
+            s += "            }\n";
+            s += "            float ndotl = dot(n, l);\n";
+            s += "            rgb += (u.directional_material.rgb * u.directional_colors[i].rgb * max(0.0, ndotl) + u.light_ambient[i].rgb) * atten;\n";
+            s += "            if (u.light_view.w > 0.0 && ndotl > 0.0)\n";
+            s += "                spec += atten * u.light_specular[i].rgb * pow(max(dot(n, normalize(l + u.light_view.xyz)), 1e-6), u.light_view.w);\n";
+            s += "        }\n";
+            s += "        v_color = vec4(clamp(rgb, 0.0, 1.0), 1.0);\n";
+            s += "        if (u.directional_flags.w > 0.5) v_color.a = u.directional_material.a;\n";
+            s += "        v_lit_specular = clamp(spec, 0.0, 1.0);\n";
+            s += "    } else {\n";
+            s += "        v_color = vec4(abs(normalize(in_normal)), 1.0);\n";
+            s += "    }\n";
+        } else {
+            s += "    v_color = vec4(0.75, 0.75, 0.78, 1.0);\n";
+        }
+
+        s += has_texcoord ? "    v_texcoord = in_texcoord;\n" : "    v_texcoord = vec2(0.0);\n";
+        if (four_coords) {
+            s += "    v_texcoord1 = in_texcoord1;\n";
+            s += "    v_texcoord2 = in_texcoord2;\n";
+            s += "    v_texcoord3 = in_texcoord3;\n";
+        } else if (two_coords) {
+            s += "    v_texcoord1 = in_texcoord1;\n";
+        }
+
+        s += "    v_reflection_coord = vec2(0.0);\n";
+        // As in the MSL source above.
+        if (has_texcoord && !layout.pretransformed) {
+            s += "    v_water_pos = (u.water_world * vec4(in_position, 1.0)).xyz;\n";
+            if (has_normal) {
+                s += "    vec3 water_normal = in_normal.x * u.water_world[0].xyz / dot(u.water_world[0].xyz, u.water_world[0].xyz)\n";
+                s += "        + in_normal.y * u.water_world[1].xyz / dot(u.water_world[1].xyz, u.water_world[1].xyz)\n";
+                s += "        + in_normal.z * u.water_world[2].xyz / dot(u.water_world[2].xyz, u.water_world[2].xyz);\n";
+                s += "    if (in_normal.y > 0.5 && water_normal.y > 0.0) v_water_tilt = water_normal.xz / water_normal.y;\n";
+            }
+        }
+        if (has_texcoord && !layout.pretransformed) {
+            if (has_normal) {
+                s += "    if (u.reflection_flags.x == 2.0) {\n";
+                s += "        v_reflection_coord = in_texcoord;\n";
+                s += "    } else if (u.reflection_flags.x > 0.5) {\n";
+                s += "        vec3 eye = (u.reflection_world_view * vec4(in_position, 1.0)).xyz;\n";
+                s += "        vec3 n = (u.reflection_normal * vec4(in_normal, 0.0)).xyz;\n";
+                s += "        if (u.reflection_flags.y > 0.5) n = normalize(n);\n";
+                s += "        vec3 r = reflect(normalize(eye), n);\n";
+                s += "        vec2 coord = (u.reflection_transform * vec4(r, 1.0)).xy;\n";
+                s += "        if (u.reflection_flags.x == 3.0) {\n";
+                s += "            v_reflection_coord = in_texcoord;\n";
+                s += "            v_texcoord = coord;\n";
+                s += "        } else v_reflection_coord = coord;\n";
+                s += "    }\n";
+            } else {
+                s += "    if (u.reflection_flags.x > 1.5) {\n";
+                s += "        v_reflection_coord = in_texcoord;\n";
+                s += "    } else if (u.reflection_flags.x > 0.5) {\n";
+                s += "        vec3 eye = (u.reflection_world_view * vec4(in_position, 1.0)).xyz;\n";
+                s += "        vec3 r = normalize(eye);\n";
+                s += "        v_reflection_coord = (u.reflection_transform * vec4(r, 1.0)).xy;\n";
+                s += "    }\n";
+            }
+        }
+        s += "    if (u.fog_params.x > 0.5) {\n";
+        s += "        float d = max(gl_Position.w, 0.0);\n";
+        s += "        float f = u.fog_params.x < 1.5 ? (u.fog_params.y - d) * u.fog_params.z\n";
+        s += "            : u.fog_params.x < 2.5 ? exp(-d * u.fog_params.y)\n";
+        s += "            : exp(-d * d * u.fog_params.y * u.fog_params.y);\n";
+        s += "        v_fog = clamp(f, 0.0, 1.0);\n";
+        s += "    }\n";
+        s += "}\n";
+    }
+    return s;
+}
+
+std::string buildGlslFragmentShader(const RecompD3dVertexLayout &layout, uint32_t fvf,
+                                    uint32_t program_count)
+{
+    const bool has_diffuse = layout.diffuse_offset != RECOMP_D3D_FVF_ABSENT;
+    const bool four_coords = (layout.texcoord_count == 4u);
+    const bool two_coords = (layout.texcoord_count == 2u);
+
+    std::string s;
+    s.reserve(4096);
+    s += "#version 450\n";
+    s += kGlslUniformsFragment;
+    s += "layout(set = 2, binding = 0) uniform sampler2D guest_texture;\n";
+    s += "layout(set = 2, binding = 1) uniform sampler2D alpha_mask;\n";
+    s += "layout(location = 0) in vec4 v_color;\n";
+    s += "layout(location = 1) in vec2 v_texcoord;\n";
+    s += "layout(location = 2) in vec2 v_reflection_coord;\n";
+    if (four_coords) {
+        s += "layout(location = 3) in vec2 v_texcoord1;\n";
+        s += "layout(location = 4) in vec2 v_texcoord2;\n";
+        s += "layout(location = 5) in vec2 v_texcoord3;\n";
+    } else if (two_coords) {
+        s += "layout(location = 3) in vec2 v_texcoord1;\n";
+    }
+    if (program_count) {
+        s += "layout(location = 6) in vec2 v_program_q;\n";
+    }
+    s += "layout(location = 7) in vec3 v_lit_specular;\n";
+    s += "layout(location = 8) in float v_fog;\n";
+    s += "layout(location = 9) in vec3 v_water_pos;\n";
+    s += "layout(location = 10) in vec2 v_water_tilt;\n";
+
+    s += "layout(location = 0) out vec4 out_color;\n";
+    s += "void main() {\n";
+    s += "    vec2 tc = v_texcoord;\n";
+    s += "    vec2 refl_tc = v_reflection_coord;\n";
+    if (program_count) {
+        s += "    tc /= v_program_q.x;\n";
+        s += "    if (u.reflection_flags.z > 0.5) refl_tc /= v_program_q.y;\n";
+    }
+    s += "    vec4 shaded = v_color;\n";
+    s += "    float water_fresnel = 0.0, water_crest = 0.0;\n";
+    s += "    vec3 water_n = vec3(0.0, 1.0, 0.0), water_v = vec3(0.0, 1.0, 0.0), water_spec = vec3(0.0), water_scatter = vec3(0.0);\n";
+    s += "    float water_footprint = length(fwidth(v_water_pos.xz));\n";
+    s += "    if (u.water_sun.w > 0.5) {\n";
+    s += "        bool sea = u.water_sun.w > 1.5;\n";
+    s += "        vec4 w = water_surface(v_water_pos.xz, u.water_eye.w, water_footprint, u.water_flow.xy,\n";
+    s += "            sea ? 1.6 : 7.0, sea ? 0.05 : 0.03);\n";
+    s += "        w.xy -= v_water_tilt;\n";
+    s += "        water_n = normalize(vec3(-w.x, 1.0, -w.y));\n";
+    s += "        water_v = normalize(u.water_eye.xyz - v_water_pos);\n";
+    s += "        vec3 hv = normalize(water_v + u.water_sun.xyz);\n";
+    s += "        float nv = max(dot(water_n, water_v), 0.001), nh = clamp(dot(water_n, hv), 0.0, 1.0);\n";
+    s += "        water_fresnel = 0.02 + 0.98 * pow(1.0 - nv, 5.0);\n";
+    s += "        float a2 = 0.002 + 2.0 * w.w, dn = nh * nh * (a2 - 1.0) + 1.0;\n";
+    s += "        float sun_fresnel = 0.02 + 0.98 * pow(1.0 - clamp(dot(water_v, hv), 0.0, 1.0), 5.0);\n";
+    s += "        water_spec = u.water_sun_color.rgb * (4.0 * a2 / (3.14159 * dn * dn) * sun_fresnel *\n";
+    s += "            clamp(dot(water_n, u.water_sun.xyz), 0.0, 1.0) / (4.0 * nv));\n";
+    s += "        if (u.fog_params.x > 0.5) water_spec *= v_fog;\n";
+    s += "        float back = pow(clamp(dot(normalize(-water_v.xz + 0.0001), normalize(u.water_sun.xz + 0.0001)), 0.0, 1.0), 4.0);\n";
+    s += "        water_crest = clamp(w.z, 0.0, 1.0);\n";
+    s += "        water_scatter = u.water_sun_color.rgb * (water_crest * water_crest * (0.3 + 0.7 * back));\n";
+    s += "        vec3 r = (u.water_view * vec4(reflect(-water_v, water_n), 0.0)).xyz;\n";
+    s += "        tc = (u.reflection_transform * vec4(r, 1.0)).xy;\n";
+    s += "    }\n";
+    s += "    if (u.reflection_flags.x > 0.5 && u.reflection_flags.x < 2.5) {\n";
+    s += "        vec4 base = texture(guest_texture, tc);\n";
+    s += "        base.a *= u.reflection_diffuse.a;\n";
+    s += "        vec4 env = texture(alpha_mask, refl_tc);\n";
+    s += "        vec4 diffuse = u.reflection_diffuse;\n";
+    s += "        if (u.directional_flags.x > 0.5) diffuse.rgb = v_color.rgb;\n";
+    s += "        shaded = mix(base, env, env.a) * diffuse;\n";
+    s += "    } else\n";
+    if (four_coords) {
+        s += "    if (u.texture_flags.z > 0.5) {\n";
+        s += "        vec4 t0 = texture(guest_texture, tc * u.texture_flags.xy);\n";
+        s += "        vec4 t1 = texture(guest_texture, v_texcoord1 * u.texture_flags.xy);\n";
+        s += "        vec4 t2 = texture(guest_texture, v_texcoord2 * u.texture_flags.xy);\n";
+        s += "        vec4 t3 = texture(guest_texture, v_texcoord3 * u.texture_flags.xy);\n";
+        s += "        shaded = 0.5 * (clamp((128.0 / 255.0) * (t0 + t1), 0.0, 1.0) + clamp((128.0 / 255.0) * (t2 + t3), 0.0, 1.0));\n";
+        s += "    } else\n";
+    } else if (two_coords) {
+        s += "    if (u.texture_flags.w > 0.5) {\n";
+        s += "        vec3 rgb = texture(guest_texture, v_texcoord1 * u.texture_flags.xy).rgb;\n";
+        s += "        float alpha = texture(alpha_mask, tc * u.lighting_flags.zw).a;\n";
+        s += "        shaded = v_color * vec4(rgb, alpha);\n";
+        s += "    } else\n";
+    }
+    s += "    if (u.blend_flags.y == 1.0) {\n";
+    s += "        shaded = u.texture_factor;\n";
+    s += "    } else if (u.draw_flags.x > 0.5) {\n";
+    s += "        vec4 sampled = texture(guest_texture,\n";
+    s += "            clamp(tc, u.texcoord_clamp.xy, u.texcoord_clamp.zw) * u.texture_flags.xy);\n";
+    s += "        if (u.lighting_flags.y > 0.5) sampled.rgb = vec3(1.0);\n";
+    s += has_diffuse ? "        shaded *= sampled;\n" : "        shaded = sampled;\n";
+    // Stage 0 combines the texture and lit diffuse as the guest's color and alpha ops select.
+    s += "        if (u.directional_flags.w > 0.5) {\n";
+    s += "            shaded.rgb = (u.light_stage.x > 0.5 ? sampled.rgb : vec3(1.0)) *\n";
+    s += "                (u.light_stage.y > 0.5 ? v_color.rgb : vec3(1.0)) *\n";
+    s += "                (u.light_stage.y > 1.5 ? v_color.rgb : vec3(1.0));\n";
+    s += "            shaded.a = (u.light_stage.z > 0.5 ? sampled.a : 1.0) *\n";
+    s += "                (u.light_stage.w > 0.5 ? v_color.a : 1.0) *\n";
+    s += "                (u.light_stage.w > 1.5 ? v_color.a : 1.0);\n";
+    s += "        } else if (u.directional_flags.x > 0.5) shaded.rgb *= v_color.rgb;\n";
+    s += "        if (u.lighting_flags.x > 0.5) shaded.rgb = vec3(0.0);\n";
+    s += "        shaded.a = (u.blend_flags.w > 0.5) ? u.blend_flags.z : (shaded.a * u.blend_flags.z);\n";
+    s += "        if (u.blend_flags.y > 1.5) shaded *= u.texture_factor;\n";
+    s += "    } else if (u.directional_flags.w > 0.5) {\n";
+    s += "        if (u.light_stage.y > 1.5) shaded.rgb *= v_color.rgb;\n";
+    s += "        if (u.light_stage.w > 1.5) shaded.a *= v_color.a;\n";
+    s += "    }\n";
+    s += "    if (u.directional_flags.w > 0.5) shaded.rgb += v_lit_specular;\n";
+    s += "    if (u.fog_params.x > 0.5) shaded.rgb = mix(u.fog_color.rgb, shaded.rgb, v_fog);\n";
+    s += "    if (u.reflection_flags.z > 1.5) {\n";
+    s += "        shaded.a *= texture(alpha_mask, refl_tc).a;\n";
+    s += "    } else if (u.reflection_flags.z > 0.5) {\n";
+    s += "        shaded.a *= texture(alpha_mask, refl_tc, u.reflection_flags.w).a;\n";
+    s += "    }\n";
+    s += "    if (u.draw_flags.y > 0.5) {\n";
+    s += "        float alpha = round(clamp(shaded.a, 0.0, 1.0) * 255.0);\n";
+    s += "        float ref = u.draw_flags.w;\n";
+    s += "        int func = int(u.draw_flags.z);\n";
+    s += "        bool alpha_pass = (func == 7) ||\n";
+    s += "            (func == 1 && alpha < ref) ||\n";
+    s += "            (func == 2 && alpha == ref) ||\n";
+    s += "            (func == 3 && alpha <= ref) ||\n";
+    s += "            (func == 4 && alpha > ref) ||\n";
+    s += "            (func == 5 && alpha != ref) ||\n";
+    s += "            (func == 6 && alpha >= ref);\n";
+    s += "        if (!alpha_pass) discard;\n";
+    s += "    }\n";
+    s += "    if (u.water_sun.w > 0.5) {\n";
+    s += "        bool sea = u.water_sun.w > 1.5, film = u.water_sun.w > 2.5 && u.water_sun.w < 3.5;\n";
+    s += "        float cover = film ? clamp(v_color.a * 3.0, 0.0, 1.0) : u.water_sun.w > 3.5 ?\n";
+    s += "            clamp((v_color.a - 0.2) * 5.0, 0.0, 1.0) : sea ? 1.0 : clamp(shaded.a, 0.0, 1.0);\n";
+    s += "        vec3 r = reflect(-water_v, water_n);\n";
+    s += "        r = normalize(vec3(r.x, max(r.y, 0.02), r.z));\n";
+    s += "        vec3 sky = mix(u.water_sky.rgb, u.water_sky.rgb * vec3(0.55, 0.7, 1.0), clamp(r.y, 0.0, 1.0));\n";
+    s += "        vec3 mirror = sea ? sky : shaded.rgb * 0.9;\n";
+    s += "        vec3 absorb = sea ? vec3(0.9, 0.16, 0.11) : vec3(1.2, 0.55, 0.7);\n";
+    s += "        vec3 body = dot(u.water_sky.rgb, vec3(0.333)) * (sea ? vec3(0.02, 0.3, 0.34) : vec3(0.02, 0.05, 0.04));\n";
+    s += "        vec3 under = body;\n";
+    s += "        float depth = 10.0, opacity = 0.5 + 0.5 * water_fresnel;\n";
+    s += "        if (u.water_scene.x > 0.5) {\n";
+    s += "            vec2 uv = gl_FragCoord.xy * u.water_flow.zw;\n";
+    s += "            vec3 bed = water_world_at(uv, water_depth_at(uv));\n";
+    s += "            depth = film ? 0.02 + 0.12 * cover : v_water_pos.y - bed.y;\n";
+    s += "            vec2 bent = uv + water_n.xz * 0.03 * clamp(depth, 0.0, 1.0);\n";
+    s += "            vec3 bent_bed = water_world_at(bent, water_depth_at(bent));\n";
+    s += "            if (!film && bent_bed.y > v_water_pos.y) { bent = uv; bent_bed = bed; }\n";
+    s += "            vec3 bed_color = textureLod(scene_color, bent, 0.0).rgb;\n";
+    s += "            if (sea) bed_color *= 1.0 + 1.5 * water_caustic(bent_bed.xz, u.water_eye.w) *\n";
+    s += "                exp(-1.5 * depth) * u.water_sun_color.rgb * clamp(2.0 * u.water_sun.y, 0.0, 1.0);\n";
+    s += "            vec3 through = exp(-absorb * (film ? depth / max(water_v.y, 0.1) : distance(bent_bed, v_water_pos)));\n";
+    s += "            under = bed_color * through + body * (1.0 - through);\n";
+    s += "            float hit;\n";
+    s += "            vec3 traced = water_trace(v_water_pos, r, gl_FragCoord.xy, hit);\n";
+    s += "            mirror = mix(mirror, traced, hit);\n";
+    s += "            opacity = 1.0;\n";
+    s += "        }\n";
+    s += "        float reflectance = max(water_fresnel, sea ? 0.04 : 0.55);\n";
+    s += "        vec3 color = mix(under + body * water_scatter * 3.0, mirror, reflectance) + water_spec;\n";
+    s += "        float foam = film || u.water_sun.w > 3.5\n";
+    s += "            ? clamp(1.0 - cover / 0.3, 0.0, 1.0) * clamp(cover / 0.05, 0.0, 1.0) * clamp(0.3 + water_crest, 0.0, 1.0)\n";
+    s += "            : clamp(1.0 - depth / 0.06, 0.0, 1.0) * clamp(0.4 + water_crest, 0.0, 1.0);\n";
+    s += "        color = mix(color, dot(u.water_sky.rgb, vec3(0.333)) * 1.1 + 0.2 * u.water_sun_color.rgb, 0.8 * foam);\n";
+    s += "        float alpha = cover * max(opacity * clamp(depth / 0.02, 0.0, 1.0), 0.8 * foam);\n";
+    s += "        shaded = vec4(color * alpha, alpha);\n";
+    s += "    }\n";
+    s += "    out_color = shaded;\n";
+    s += "}\n";
+
+    return s;
+}
+
+// Vulkan takes SPIR-V; the generated GLSL is compiled at runtime by shaderc,
+// loaded on demand so the runner has no build-time dependency on it. SteamOS
+// and most distributions ship libshaderc_shared; the Windows build copies
+// shaderc.dll beside the runner.
+typedef void *(*ShadercCompilerInitFn)();
+typedef void *(*ShadercCompileOptionsInitFn)();
+typedef void *(*ShadercCompileIntoSpvFn)(void *, const char *, size_t, int, const char *, const char *, void *);
+typedef int (*ShadercResultStatusFn)(void *);
+typedef const char *(*ShadercResultErrorFn)(void *);
+typedef const char *(*ShadercResultBytesFn)(void *);
+typedef size_t (*ShadercResultLengthFn)(void *);
+typedef void (*ShadercResultReleaseFn)(void *);
+
+static ShadercCompilerInitFn s_shaderc_init = nullptr;
+static ShadercCompileOptionsInitFn s_shaderc_opt_init = nullptr;
+static ShadercCompileIntoSpvFn s_shaderc_compile = nullptr;
+static ShadercResultStatusFn s_shaderc_status = nullptr;
+static ShadercResultErrorFn s_shaderc_error = nullptr;
+static ShadercResultBytesFn s_shaderc_bytes = nullptr;
+static ShadercResultLengthFn s_shaderc_length = nullptr;
+static ShadercResultReleaseFn s_shaderc_res_release = nullptr;
+
+static bool loadShadercSymbols() {
+#ifdef _WIN32
+    SDL_SharedObject *h = SDL_LoadObject("shaderc.dll");
+#else
+    SDL_SharedObject *h = SDL_LoadObject("libshaderc_shared.so.1");
+    if (!h) h = SDL_LoadObject("libshaderc_shared.so");
+    if (!h) h = SDL_LoadObject("libshaderc.so.1");  // Debian and Ubuntu name
+    if (!h) h = SDL_LoadObject("libshaderc.so");
+    if (!h) h = SDL_LoadObject("./libs.aarch64/libshaderc_shared.so.1");
+#endif
+    if (!h) return false;
+    s_shaderc_init = (ShadercCompilerInitFn)SDL_LoadFunction(h, "shaderc_compiler_initialize");
+    s_shaderc_opt_init = (ShadercCompileOptionsInitFn)SDL_LoadFunction(h, "shaderc_compile_options_initialize");
+    s_shaderc_compile = (ShadercCompileIntoSpvFn)SDL_LoadFunction(h, "shaderc_compile_into_spv");
+    s_shaderc_status = (ShadercResultStatusFn)SDL_LoadFunction(h, "shaderc_result_get_compilation_status");
+    s_shaderc_error = (ShadercResultErrorFn)SDL_LoadFunction(h, "shaderc_result_get_error_message");
+    s_shaderc_bytes = (ShadercResultBytesFn)SDL_LoadFunction(h, "shaderc_result_get_bytes");
+    s_shaderc_length = (ShadercResultLengthFn)SDL_LoadFunction(h, "shaderc_result_get_length");
+    s_shaderc_res_release = (ShadercResultReleaseFn)SDL_LoadFunction(h, "shaderc_result_release");
+    if (!s_shaderc_init || !s_shaderc_compile || !s_shaderc_status || !s_shaderc_bytes ||
+        !s_shaderc_length || !s_shaderc_res_release) {
+        s_shaderc_compile = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// The boot-shader thread and the render thread both compile; load shaderc once.
+static bool loadShaderc() {
+    static const bool loaded = loadShadercSymbols();
+    return loaded;
+}
+
+static void *s_persistent_compiler = nullptr;
+static void *s_persistent_options = nullptr;
+static std::mutex s_compiler_mutex;
+
+static std::vector<uint32_t> compileGlslToSpirv(const std::string &source, SDL_GPUShaderStage stage) {
+    std::vector<uint32_t> spv;
+    const uint32_t stage_id = (stage == SDL_GPU_SHADERSTAGE_VERTEX) ? 0u : 1u;
+    if (projecttenshin::vulkan::spirv_cache_load(source, stage_id, spv)) {
+        return spv;
+    }
+    if (!loadShaderc()) {
+#ifdef _WIN32
+        std::fprintf(stderr, "[presenter] Vulkan shaders need shaderc.dll beside the runner\n");
+#else
+        std::fprintf(stderr, "[presenter] Vulkan shaders need shaderc (libshaderc_shared.so.1, "
+                             "or libshaderc.so.1 from the libshaderc1 package)\n");
+#endif
+        return spv;
+    }
+    std::lock_guard<std::mutex> lock(s_compiler_mutex);
+    if (!s_persistent_compiler) {
+        s_persistent_compiler = s_shaderc_init();
+        if (s_shaderc_opt_init) {
+            s_persistent_options = s_shaderc_opt_init();
+        }
+    }
+    if (!s_persistent_compiler) return spv;
+    const int kind = static_cast<int>(stage_id); // shaderc_vertex_shader, shaderc_fragment_shader
+    void *result = s_shaderc_compile(s_persistent_compiler, source.c_str(), source.size(), kind, "main.glsl", "main", s_persistent_options);
+    if (!result) return spv;
+    if (s_shaderc_status(result) == 0) {
+        const size_t len = s_shaderc_length(result);
+        if (len >= 4 && (len % 4 == 0)) {
+            spv.resize(len / 4);
+            std::memcpy(spv.data(), s_shaderc_bytes(result), len);
+            projecttenshin::vulkan::spirv_cache_save(source, stage_id, spv);
+        }
+    } else if (s_shaderc_error) {
+        std::fprintf(stderr, "[presenter] shaderc compilation failed: %s\n", s_shaderc_error(result));
+    }
+    s_shaderc_res_release(result);
+    return spv;
+}
+
+// Failures are cached too, so a shader that cannot build is not retried on every draw.
+// The boot-shader thread may finish the same key first; keep its pair and drop ours.
+ShaderPair rememberShaderPair(RecompD3dPresenter *presenter, uint64_t key, ShaderPair pair)
+{
+    std::lock_guard<std::mutex> lock(presenter->shader_mutex);
+    const auto [it, inserted] = presenter->shader_cache.emplace(key, pair);
+    if (!inserted) {
+        if (pair.vertex_shader) SDL_ReleaseGPUShader(presenter->device, pair.vertex_shader);
+        if (pair.fragment_shader) SDL_ReleaseGPUShader(presenter->device, pair.fragment_shader);
+    }
+    return it->second;
+}
+
+thread_local bool precompiling; // the boot-shader thread, whose builds hold up no frame
+
+// A build on the render thread holds up the frame that needed it; logged on every return.
+struct ShaderBuildLog {
+    uint32_t fvf;
+    uint64_t key;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~ShaderBuildLog()
+    {
+        if (precompiling) return;
+        std::fprintf(stderr, "recomp d3d presenter: built draw shader fvf=0x%03X %016llx in %.1f ms\n", fvf,
+            static_cast<unsigned long long>(key),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }
+};
+
+ShaderPair getOrCreateShaderPair(RecompD3dPresenter *presenter, const RecompD3dVertexLayout &layout,
+                                 uint32_t fvf, uint32_t program_count, const uint32_t (*program_tokens)[4])
+{
+    uint64_t shader_key = fvf ^ (static_cast<uint64_t>(program_count) << 32);
+    if (program_count && program_tokens) {
+        shader_key ^= programHash(program_tokens, program_count);
+    }
+    {
+        std::lock_guard<std::mutex> lock(presenter->shader_mutex);
+        auto it = presenter->shader_cache.find(shader_key);
+        if (it != presenter->shader_cache.end()) {
+            return it->second;
+        }
+    }
+    const ShaderBuildLog log{fvf, shader_key};
+    // The D3D11 presenter accepts vertex programs only with this FVF.
+    if (program_count && fvf != 0x112u) return rememberShaderPair(presenter, shader_key, {});
+
+    if (presenter->use_spirv) {
+        const std::string vs_source = buildGlslVertexShader(layout, fvf, program_count, program_tokens);
+        if (vs_source.empty()) return rememberShaderPair(presenter, shader_key, {});
+        const std::vector<uint32_t> vs_spv = compileGlslToSpirv(vs_source, SDL_GPU_SHADERSTAGE_VERTEX);
+        const std::vector<uint32_t> fs_spv = compileGlslToSpirv(
+            buildGlslFragmentShader(layout, fvf, program_count), SDL_GPU_SHADERSTAGE_FRAGMENT);
+        if (vs_spv.empty() || fs_spv.empty()) {
+            std::fprintf(stderr, "[presenter] failed to compile GLSL->SPIR-V shader fvf=0x%08X\n", fvf);
+            return rememberShaderPair(presenter, shader_key, {});
+        }
+        const uint32_t *vs_code = vs_spv.data();
+        const size_t vs_size = vs_spv.size() * sizeof(uint32_t);
+        const uint32_t *fs_code = fs_spv.data();
+        const size_t fs_size = fs_spv.size() * sizeof(uint32_t);
+
+        SDL_GPUShaderCreateInfo vs_info{};
+        vs_info.code_size = vs_size;
+        vs_info.code = reinterpret_cast<const Uint8 *>(vs_code);
+        vs_info.entrypoint = "main";
+        vs_info.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        vs_info.stage = SDL_GPU_SHADERSTAGE_VERTEX;
+        vs_info.num_uniform_buffers = program_count ? 2 : 1;
+        SDL_GPUShader *vs = SDL_CreateGPUShader(presenter->device, &vs_info);
+
+        SDL_GPUShaderCreateInfo fs_info{};
+        fs_info.code_size = fs_size;
+        fs_info.code = reinterpret_cast<const Uint8 *>(fs_code);
+        fs_info.entrypoint = "main";
+        fs_info.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        fs_info.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+        fs_info.num_samplers = 4;  // guest texture, mask, then modern water's scene color and depth
+        fs_info.num_uniform_buffers = 1;
+        SDL_GPUShader *fs = SDL_CreateGPUShader(presenter->device, &fs_info);
+
+        if (!vs || !fs) {
+            std::fprintf(stderr, "[presenter] failed to create SPIR-V shader fvf=0x%08X: %s\n", fvf, SDL_GetError());
+            if (vs) SDL_ReleaseGPUShader(presenter->device, vs);
+            if (fs) SDL_ReleaseGPUShader(presenter->device, fs);
+            return rememberShaderPair(presenter, shader_key, {});
+        }
+
+        return rememberShaderPair(presenter, shader_key, {vs, fs});
+    }
+
+    std::string msl = buildMslShader(layout, fvf, program_count, program_tokens);
+    if (msl.empty()) return rememberShaderPair(presenter, shader_key, {});
+    SDL_GPUShaderCreateInfo vs_info{};
+    vs_info.code_size = msl.size();
+    vs_info.code = reinterpret_cast<const Uint8 *>(msl.c_str());
+    vs_info.entrypoint = "vs_main";
+    vs_info.format = SDL_GPU_SHADERFORMAT_MSL;
+    vs_info.stage = SDL_GPU_SHADERSTAGE_VERTEX;
+    vs_info.num_uniform_buffers = program_count ? 2 : 1;
+    SDL_GPUShader *vs = SDL_CreateGPUShader(presenter->device, &vs_info);
+
+    SDL_GPUShaderCreateInfo fs_info{};
+    fs_info.code_size = msl.size();
+    fs_info.code = reinterpret_cast<const Uint8 *>(msl.c_str());
+    fs_info.entrypoint = "ps_main";
+    fs_info.format = SDL_GPU_SHADERFORMAT_MSL;
+    fs_info.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+    fs_info.num_samplers = 4;
+    fs_info.num_uniform_buffers = 1;
+    SDL_GPUShader *fs = SDL_CreateGPUShader(presenter->device, &fs_info);
+
+    if (!vs || !fs) {
+        std::fprintf(stderr, "[presenter] failed to compile MSL shader fvf=0x%08X: %s\n", fvf, SDL_GetError());
+        if (vs) SDL_ReleaseGPUShader(presenter->device, vs);
+        if (fs) SDL_ReleaseGPUShader(presenter->device, fs);
+        return rememberShaderPair(presenter, shader_key, {});
+    }
+
+    return rememberShaderPair(presenter, shader_key, {vs, fs});
+}
+
+void precompileBootShaders(RecompD3dPresenter *p)
+{
+    precompiling = true;
+    for (const uint32_t fvf : kBootDrawFvfs) {
+        if (p->precompile_stop.load()) return;
+        RecompD3dVertexLayout layout{};
+        if (!recomp_d3d_fvf_layout(fvf, &layout)) continue;
+        getOrCreateShaderPair(p, layout, fvf, 0u, nullptr);
+    }
+}
+
+/* The D3D11 presenter's gamma pass: each channel indexes its own ramp. */
+constexpr char kGammaMsl[] = R"(#include <metal_stdlib>
+using namespace metal;
+struct GammaRamp { float4 ramp[256]; };
+struct GammaOut { float4 position [[position]]; };
+vertex GammaOut gamma_vs(uint id [[vertex_id]]) {
+    float2 p = float2(float((id << 1u) & 2u), float(id & 2u));
+    GammaOut out;
+    out.position = float4(p * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return out;
+}
+fragment float4 gamma_ps(GammaOut in [[stage_in]], texture2d<float> pixels [[texture(0)]],
+                         sampler pixel_sampler [[sampler(0)]], constant GammaRamp &g [[buffer(0)]]) {
+    float4 c = pixels.read(uint2(in.position.xy));
+    uint3 i = uint3(saturate(c.rgb) * 255.0 + 0.5);
+    return float4(g.ramp[i.r].r, g.ramp[i.g].g, g.ramp[i.b].b, c.a);
+}
+)";
+
+constexpr char kGammaGlslVertex[] = R"(#version 450
+void main() {
+    vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
+    gl_Position = vec4(p * vec2(2.0, -2.0) + vec2(-1.0, 1.0), 0.0, 1.0);
+}
+)";
+
+constexpr char kGammaGlslFragment[] = R"(#version 450
+layout(set = 2, binding = 0) uniform sampler2D pixels;
+layout(set = 3, binding = 0, std140) uniform GammaRamp { vec4 ramp[256]; } g;
+layout(location = 0) out vec4 out_color;
+void main() {
+    vec4 c = texelFetch(pixels, ivec2(gl_FragCoord.xy), 0);
+    uvec3 i = uvec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);
+    out_color = vec4(g.ramp[i.r].r, g.ramp[i.g].g, g.ramp[i.b].b, c.a);
+}
+)";
+
+bool ensureGammaPass(RecompD3dPresenter *p)
+{
+    if (p->gamma_pipeline) return true;
+    SDL_GPUShaderCreateInfo vs_info{};
+    SDL_GPUShaderCreateInfo fs_info{};
+    std::vector<uint32_t> vs_spv, fs_spv;
+    if (p->use_spirv) {
+        vs_spv = compileGlslToSpirv(kGammaGlslVertex, SDL_GPU_SHADERSTAGE_VERTEX);
+        fs_spv = compileGlslToSpirv(kGammaGlslFragment, SDL_GPU_SHADERSTAGE_FRAGMENT);
+        if (vs_spv.empty() || fs_spv.empty()) return false;
+        vs_info.code = reinterpret_cast<const Uint8 *>(vs_spv.data());
+        vs_info.code_size = vs_spv.size() * sizeof(uint32_t);
+        vs_info.entrypoint = "main";
+        vs_info.format = SDL_GPU_SHADERFORMAT_SPIRV;
+        fs_info.code = reinterpret_cast<const Uint8 *>(fs_spv.data());
+        fs_info.code_size = fs_spv.size() * sizeof(uint32_t);
+        fs_info.entrypoint = "main";
+        fs_info.format = SDL_GPU_SHADERFORMAT_SPIRV;
+    } else {
+        vs_info.code = reinterpret_cast<const Uint8 *>(kGammaMsl);
+        vs_info.code_size = sizeof kGammaMsl - 1u;
+        vs_info.entrypoint = "gamma_vs";
+        vs_info.format = SDL_GPU_SHADERFORMAT_MSL;
+        fs_info.code = vs_info.code;
+        fs_info.code_size = vs_info.code_size;
+        fs_info.entrypoint = "gamma_ps";
+        fs_info.format = SDL_GPU_SHADERFORMAT_MSL;
+    }
+    vs_info.stage = SDL_GPU_SHADERSTAGE_VERTEX;
+    fs_info.stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+    fs_info.num_samplers = 1;
+    fs_info.num_uniform_buffers = 1;
+    SDL_GPUShader *vs = SDL_CreateGPUShader(p->device, &vs_info);
+    SDL_GPUShader *fs = vs ? SDL_CreateGPUShader(p->device, &fs_info) : nullptr;
+
+    SDL_GPUTextureCreateInfo target_info{};
+    target_info.type = SDL_GPU_TEXTURETYPE_2D;
+    target_info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    target_info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    target_info.width = mainWidth(p);
+    target_info.height = mainHeight(p);
+    target_info.layer_count_or_depth = 1;
+    target_info.num_levels = 1;
+    p->gamma_target = fs ? SDL_CreateGPUTexture(p->device, &target_info) : nullptr;
+    if (p->gamma_target) {
+        SDL_GPUColorTargetDescription color{};
+        color.format = target_info.format;
+        SDL_GPUGraphicsPipelineCreateInfo info{};
+        info.vertex_shader = vs;
+        info.fragment_shader = fs;
+        info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        info.target_info.color_target_descriptions = &color;
+        info.target_info.num_color_targets = 1;
+        p->gamma_pipeline = SDL_CreateGPUGraphicsPipeline(p->device, &info);
+    }
+    if (!p->gamma_pipeline) {
+        std::fprintf(stderr, "recomp d3d presenter: gamma pass unavailable: %s\n", SDL_GetError());
+        if (p->gamma_target) SDL_ReleaseGPUTexture(p->device, p->gamma_target);
+        p->gamma_target = nullptr;
+    }
+    if (vs) SDL_ReleaseGPUShader(p->device, vs);
+    if (fs) SDL_ReleaseGPUShader(p->device, fs);
+    return p->gamma_pipeline != nullptr;
+}
+
+SDL_GPUGraphicsPipeline *getOrCreatePipeline(RecompD3dPresenter *presenter,
+                                             const RecompD3dPresenterDrawCommand &draw,
+                                             const RecompD3dVertexLayout &layout,
+                                             SDL_GPUTextureFormat color_fmt,
+                                             SDL_GPUTextureFormat depth_fmt,
+                                             SDL_GPUSampleCount sample_count)
+{
+    const SDL_GPUPrimitiveType primitive =
+        draw.primitive_type == RECOMP_D3D_PT_TRIANGLESTRIP ? SDL_GPU_PRIMITIVETYPE_TRIANGLESTRIP
+        : draw.primitive_type == 2u ? SDL_GPU_PRIMITIVETYPE_LINELIST
+        : SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    uint64_t prog_hash = draw.program_count ? programHash(draw.program, draw.program_count) : 0u;
+
+    PipelineKey pkey{};
+    pkey.fvf = draw.fvf;
+    pkey.vertex_stride = draw.vertex_stride;
+    pkey.program_count = draw.program_count;
+    pkey.program_hash = prog_hash;
+    pkey.primitive = primitive;
+    pkey.cull_mode = draw.cull_mode;
+    pkey.color_format = color_fmt;
+    pkey.depth_format = depth_fmt;
+    pkey.sample_count = sample_count;
+    // Modern water's alpha is its opacity, already blended; coverage would thin it twice.
+    pkey.alpha_to_coverage = sample_count != SDL_GPU_SAMPLECOUNT_1 && draw.depth.alpha_test_enable &&
+        !draw.water.enabled;
+
+    pkey.depth_test_enable = draw.depth.depth_test_enable;
+    pkey.depth_write_enable = draw.depth.depth_write_enable;
+    pkey.depth_func = (pkey.depth_test_enable || pkey.depth_write_enable)
+        ? draw.depth.depth_func : RECOMP_D3D_COMPARE_LESS_EQUAL;
+
+    pkey.stencil_enable = draw.depth.stencil_enable;
+    if (pkey.stencil_enable) {
+        pkey.stencil_read_mask = static_cast<uint8_t>(draw.depth.stencil_read_mask);
+        pkey.stencil_write_mask = static_cast<uint8_t>(draw.depth.stencil_write_mask);
+        pkey.stencil_func = draw.depth.stencil_func;
+        pkey.stencil_fail = draw.depth.stencil_fail;
+        pkey.stencil_zfail = draw.depth.stencil_zfail;
+        pkey.stencil_pass = draw.depth.stencil_pass;
+    } else {
+        pkey.stencil_read_mask = 0xff;
+        pkey.stencil_write_mask = 0xff;
+        pkey.stencil_func = RECOMP_D3D_COMPARE_ALWAYS;
+        pkey.stencil_fail = RECOMP_D3D_STENCIL_KEEP;
+        pkey.stencil_zfail = RECOMP_D3D_STENCIL_KEEP;
+        pkey.stencil_pass = RECOMP_D3D_STENCIL_KEEP;
+    }
+
+    pkey.blend_enable = draw.blend.blend_enable;
+    pkey.color_write_mask = draw.blend.color_write_mask;
+    if (pkey.blend_enable) {
+        pkey.src_factor = draw.blend.src_factor;
+        pkey.dst_factor = draw.blend.dst_factor;
+        pkey.blend_op = draw.blend.op;
+    } else {
+        pkey.src_factor = RECOMP_D3D_BLEND_ONE;
+        pkey.dst_factor = RECOMP_D3D_BLEND_ZERO;
+        pkey.blend_op = RECOMP_D3D_BLEND_OP_ADD;
+    }
+
+    if (presenter->last_pipeline != nullptr && presenter->last_pkey == pkey) {
+        return presenter->last_pipeline;
+    }
+
+    auto it = presenter->pipelines.find(pkey);
+    if (it != presenter->pipelines.end()) {
+        presenter->last_pkey = pkey;
+        presenter->last_pipeline = it->second;
+        return it->second;
+    }
+
+    ShaderPair shaders = getOrCreateShaderPair(presenter, layout, draw.fvf, draw.program_count,
+                                               draw.program_count ? draw.program : nullptr);
+    if (!shaders.vertex_shader || !shaders.fragment_shader) {
+        presenter->pipelines[pkey] = nullptr;  // like D3D11, do not retry a failed draw state
+        return nullptr;
+    }
+
+    SDL_GPUGraphicsPipelineCreateInfo pinfo{};
+    pinfo.vertex_shader = shaders.vertex_shader;
+    pinfo.fragment_shader = shaders.fragment_shader;
+    pinfo.primitive_type = primitive;
+    pinfo.multisample_state.sample_count = sample_count;
+    pinfo.multisample_state.enable_alpha_to_coverage = pkey.alpha_to_coverage;
+
+    // Rasterizer state
+    pinfo.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    if (draw.cull_mode == RECOMP_D3D_CULL_NONE) {
+        pinfo.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        pinfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
+    } else if (draw.cull_mode == RECOMP_D3D_CULL_CLOCKWISE) {
+        pinfo.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_BACK;
+        pinfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    } else {
+        pinfo.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_BACK;
+        pinfo.rasterizer_state.front_face = SDL_GPU_FRONTFACE_CLOCKWISE;
+    }
+
+    // Depth-stencil state
+    pinfo.depth_stencil_state.enable_depth_test = pkey.depth_test_enable;
+    pinfo.depth_stencil_state.enable_depth_write = pkey.depth_write_enable;
+    pinfo.depth_stencil_state.compare_op = hostCompareOp(pkey.depth_func);
+    pinfo.depth_stencil_state.enable_stencil_test = pkey.stencil_enable;
+    pinfo.depth_stencil_state.compare_mask = pkey.stencil_read_mask;
+    pinfo.depth_stencil_state.write_mask = pkey.stencil_write_mask;
+    pinfo.depth_stencil_state.front_stencil_state.fail_op = hostStencilOp(pkey.stencil_fail);
+    pinfo.depth_stencil_state.front_stencil_state.pass_op = hostStencilOp(pkey.stencil_pass);
+    pinfo.depth_stencil_state.front_stencil_state.depth_fail_op = hostStencilOp(pkey.stencil_zfail);
+    pinfo.depth_stencil_state.front_stencil_state.compare_op = hostCompareOp(pkey.stencil_func);
+    pinfo.depth_stencil_state.back_stencil_state = pinfo.depth_stencil_state.front_stencil_state;
+
+    // Target info & blend
+    SDL_GPUColorTargetDescription color_desc{};
+    color_desc.format = color_fmt;
+    color_desc.blend_state.enable_blend = pkey.blend_enable;
+    color_desc.blend_state.src_color_blendfactor = hostBlendFactor(pkey.src_factor, false);
+    color_desc.blend_state.dst_color_blendfactor = hostBlendFactor(pkey.dst_factor, false);
+    color_desc.blend_state.color_blend_op = hostBlendOp(pkey.blend_op);
+    color_desc.blend_state.src_alpha_blendfactor = hostBlendFactor(pkey.src_factor, true);
+    color_desc.blend_state.dst_alpha_blendfactor = hostBlendFactor(pkey.dst_factor, true);
+    color_desc.blend_state.alpha_blend_op = hostBlendOp(pkey.blend_op);
+    color_desc.blend_state.color_write_mask = pkey.color_write_mask;
+    color_desc.blend_state.enable_color_write_mask = true;
+
+    pinfo.target_info.color_target_descriptions = &color_desc;
+    // Modern water's depth pass has no color target.
+    pinfo.target_info.num_color_targets = color_fmt != SDL_GPU_TEXTUREFORMAT_INVALID ? 1 : 0;
+    pinfo.target_info.depth_stencil_format = depth_fmt;
+    pinfo.target_info.has_depth_stencil_target = (depth_fmt != SDL_GPU_TEXTUREFORMAT_INVALID);
+
+    // Vertex input layout
+    SDL_GPUVertexBufferDescription vb_desc{};
+    vb_desc.slot = 0;
+    vb_desc.pitch = draw.vertex_stride;
+    vb_desc.input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+
+    SDL_GPUVertexAttribute attributes[8]{};
+    Uint32 attr_count = 0;
+
+    // Position (attr 0)
+    attributes[attr_count].location = 0;
+    attributes[attr_count].buffer_slot = 0;
+    attributes[attr_count].format = layout.pretransformed ? SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4 : SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
+    attributes[attr_count].offset = layout.position_offset;
+    ++attr_count;
+
+    // Weights (attr 1)
+    if (layout.blend_weight_count != 0u) {
+        attributes[attr_count].location = 1;
+        attributes[attr_count].buffer_slot = 0;
+        attributes[attr_count].format = (layout.blend_weight_count == 1u) ? SDL_GPU_VERTEXELEMENTFORMAT_FLOAT :
+            ((layout.blend_weight_count == 2u) ? SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2 : SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3);
+        attributes[attr_count].offset = 12u;
+        ++attr_count;
+    }
+
+    // Normal (attr 2)
+    if (layout.normal_offset != RECOMP_D3D_FVF_ABSENT) {
+        attributes[attr_count].location = 2;
+        attributes[attr_count].buffer_slot = 0;
+        attributes[attr_count].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
+        attributes[attr_count].offset = layout.normal_offset;
+        ++attr_count;
+    }
+
+    // Diffuse (attr 3)
+    if (layout.diffuse_offset != RECOMP_D3D_FVF_ABSENT) {
+        attributes[attr_count].location = 3;
+        attributes[attr_count].buffer_slot = 0;
+        attributes[attr_count].format = SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM;
+        attributes[attr_count].offset = layout.diffuse_offset;
+        ++attr_count;
+    }
+
+    // Texcoords (attr 4..7)
+    if (layout.texcoord_offset != RECOMP_D3D_FVF_ABSENT) {
+        const uint32_t tc_count = (layout.texcoord_count == 4u) ? 4u : ((layout.texcoord_count == 2u) ? 2u : 1u);
+        for (uint32_t i = 0u; i < tc_count; ++i) {
+            attributes[attr_count].location = 4u + i;
+            attributes[attr_count].buffer_slot = 0;
+            attributes[attr_count].format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
+            attributes[attr_count].offset = layout.texcoord_offset + i * 8u;
+            ++attr_count;
+        }
+    }
+
+    pinfo.vertex_input_state.vertex_buffer_descriptions = &vb_desc;
+    pinfo.vertex_input_state.num_vertex_buffers = 1;
+    pinfo.vertex_input_state.vertex_attributes = attributes;
+    pinfo.vertex_input_state.num_vertex_attributes = attr_count;
+
+    SDL_GPUGraphicsPipeline *pipe = SDL_CreateGPUGraphicsPipeline(presenter->device, &pinfo);
+    if (!pipe) {
+        std::fprintf(stderr, "[presenter] failed to create pipeline fvf=0x%08X: %s\n", draw.fvf, SDL_GetError());
+        presenter->pipelines[pkey] = nullptr;
+        return nullptr;
+    }
+
+    presenter->pipelines[pkey] = pipe;
+    presenter->last_pkey = pkey;
+    presenter->last_pipeline = pipe;
+    return pipe;
+}
+
+void flushSegment(RecompD3dPresenter *presenter)
+{
+    DrawSegment &seg = presenter->segment;
+    if (seg.draws.empty()) {
+        releaseRetiredTextures(presenter);
+        return;
+    }
+
+    const uint32_t seg_v_bytes = static_cast<uint32_t>(seg.vertex_data.size());
+    const uint32_t seg_i_bytes = static_cast<uint32_t>(seg.index_data.size());
+
+    if (seg_v_bytes > presenter->draw_vertex_capacity ||
+        seg_i_bytes > presenter->draw_index_capacity) {
+        if (!ensureDynamicBuffers(presenter, seg_v_bytes, seg_i_bytes)) {
+            seg.draws.clear();
+            seg.vertex_data.clear();
+            seg.index_data.clear();
+            seg.uniform_data.clear();
+            seg.water_depth_pending = false;
+            releaseRetiredTextures(presenter);
+            return;
+        }
+    }
+
+    uint32_t seg_v_base = (presenter->draw_vertex_used + 255u) & ~255u;
+    uint32_t seg_i_base = (presenter->draw_index_used + 255u) & ~255u;
+
+    const bool wrap_v = (seg_v_base + seg_v_bytes > presenter->draw_vertex_capacity);
+    const bool wrap_i = (seg_i_base + seg_i_bytes > presenter->draw_index_capacity);
+    if (wrap_v) seg_v_base = 0u;
+    if (wrap_i) seg_i_base = 0u;
+
+    void *vmap = SDL_MapGPUTransferBuffer(presenter->device, presenter->draw_vertex_transfer, wrap_v);
+    if (vmap) {
+        std::memcpy(static_cast<uint8_t *>(vmap) + seg_v_base, seg.vertex_data.data(), seg_v_bytes);
+        SDL_UnmapGPUTransferBuffer(presenter->device, presenter->draw_vertex_transfer);
+    }
+    void *imap = SDL_MapGPUTransferBuffer(presenter->device, presenter->draw_index_transfer, wrap_i);
+    if (imap) {
+        std::memcpy(static_cast<uint8_t *>(imap) + seg_i_base, seg.index_data.data(), seg_i_bytes);
+        SDL_UnmapGPUTransferBuffer(presenter->device, presenter->draw_index_transfer);
+    }
+
+    SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+    SDL_GPUCopyPass *cpass = SDL_BeginGPUCopyPass(cmdbuf);
+    if (cpass) {
+        SDL_GPUTransferBufferLocation vsrc{presenter->draw_vertex_transfer, seg_v_base};
+        SDL_GPUBufferRegion vdst{presenter->draw_vertex_buffer, seg_v_base, seg_v_bytes};
+        SDL_UploadToGPUBuffer(cpass, &vsrc, &vdst, wrap_v);
+
+        SDL_GPUTransferBufferLocation isrc{presenter->draw_index_transfer, seg_i_base};
+        SDL_GPUBufferRegion idst{presenter->draw_index_buffer, seg_i_base, seg_i_bytes};
+        SDL_UploadToGPUBuffer(cpass, &isrc, &idst, wrap_i);
+        SDL_EndGPUCopyPass(cpass);
+    }
+
+    const bool is_main = (seg.target_color == presenter->backbuffer_color);
+    const bool use_depth = (seg.target_depth != nullptr);
+
+    SDL_GPUColorTargetInfo color_info{};
+    color_info.texture = seg.target_color;
+    color_info.load_op = SDL_GPU_LOADOP_LOAD;
+    color_info.store_op = SDL_GPU_STOREOP_STORE;
+    if (is_main) {
+        presenter->backbuffer_resolved = false;
+    }
+
+    SDL_GPUDepthStencilTargetInfo depth_info{};
+    if (use_depth) {
+        depth_info.texture = seg.target_depth;
+        depth_info.load_op = SDL_GPU_LOADOP_LOAD;
+        depth_info.store_op = SDL_GPU_STOREOP_STORE;
+        depth_info.stencil_load_op = SDL_GPU_LOADOP_LOAD;
+        depth_info.stencil_store_op = SDL_GPU_STOREOP_STORE;
+    }
+
+    SDL_GPURenderPass *rpass = SDL_BeginGPURenderPass(cmdbuf, &color_info, 1, use_depth ? &depth_info : nullptr);
+    if (rpass) {
+        SDL_GPUViewport viewport{0.0f, 0.0f, seg.target_w, seg.target_h, 0.0f, 1.0f};
+        SDL_SetGPUViewport(rpass, &viewport);
+        SDL_Rect scissor{0, 0, static_cast<int>(seg.target_w), static_cast<int>(seg.target_h)};
+        SDL_SetGPUScissor(rpass, &scissor);
+
+        SDL_GPUGraphicsPipeline *last_pipe = nullptr;
+        uint32_t last_v_offset = UINT32_MAX;
+        uint32_t last_i_offset = UINT32_MAX;
+        uint32_t last_vs_offset = UINT32_MAX;
+        uint32_t last_vs_size = 0;
+        uint32_t last_fs_offset = UINT32_MAX;
+        uint32_t last_program_offset = UINT32_MAX;
+        uint32_t last_fs_size = 0;
+        SDL_GPUTexture *last_t0 = nullptr;
+        SDL_GPUSampler *last_s0 = nullptr;
+        SDL_GPUTexture *last_t1 = nullptr;
+        SDL_GPUSampler *last_s1 = nullptr;
+        int last_water = -1;
+        // Wider than the values they track, so the first draw always sets them.
+        uint64_t last_constant_color = UINT64_MAX;
+        int last_stencil_ref = -1;
+        SDL_GPUViewport last_viewport = viewport;
+
+        for (const QueuedDraw &q : seg.draws) {
+            if (!q.pipeline) continue;
+
+            if (q.pipeline != last_pipe) {
+                SDL_BindGPUGraphicsPipeline(rpass, q.pipeline);
+                last_pipe = q.pipeline;
+            }
+
+            const uint32_t cur_v_offset = seg_v_base + q.vertex_offset;
+            if (cur_v_offset != last_v_offset) {
+                SDL_GPUBufferBinding vbinding{presenter->draw_vertex_buffer, cur_v_offset};
+                SDL_BindGPUVertexBuffers(rpass, 0, &vbinding, 1);
+                last_v_offset = cur_v_offset;
+            }
+
+            const uint32_t cur_i_offset = seg_i_base + q.index_offset;
+            if (cur_i_offset != last_i_offset) {
+                SDL_GPUBufferBinding ibinding{presenter->draw_index_buffer, cur_i_offset};
+                SDL_BindGPUIndexBuffer(rpass, &ibinding, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+                last_i_offset = cur_i_offset;
+            }
+
+            if (q.uniform_offset != last_vs_offset || q.vs_uniform_size != last_vs_size) {
+                SDL_PushGPUVertexUniformData(cmdbuf, 0, &seg.uniform_data[q.uniform_offset], q.vs_uniform_size * sizeof(float));
+                last_vs_offset = q.uniform_offset;
+                last_vs_size = q.vs_uniform_size;
+            }
+
+            if (q.program_offset != kNoProgramConstants && q.program_offset != last_program_offset) {
+                SDL_PushGPUVertexUniformData(cmdbuf, 1, &seg.uniform_data[q.program_offset], kProgramConstantFloats * sizeof(float));
+                last_program_offset = q.program_offset;
+            }
+
+            if (q.uniform_offset != last_fs_offset || q.fs_uniform_size != last_fs_size) {
+                SDL_PushGPUFragmentUniformData(cmdbuf, 0, &seg.uniform_data[q.uniform_offset], q.fs_uniform_size * sizeof(float));
+                last_fs_offset = q.uniform_offset;
+                last_fs_size = q.fs_uniform_size;
+            }
+
+            SDL_GPUTexture *t0 = q.texture ? q.texture : presenter->dummy_texture;
+            SDL_GPUTexture *t1 = q.mask_texture ? q.mask_texture : presenter->dummy_texture;
+            if (t0 != last_t0 || q.sampler0 != last_s0 || t1 != last_t1 || q.sampler1 != last_s1 ||
+                static_cast<int>(q.water_scene) != last_water) {
+                SDL_GPUTextureSamplerBinding samplers[4] = {
+                    {t0, q.sampler0},
+                    {t1, q.sampler1},
+                    {q.water_scene ? presenter->water_color : presenter->dummy_texture, presenter->filter_sampler},
+                    {q.water_scene ? presenter->water_depth : presenter->dummy_texture, presenter->point_sampler}
+                };
+                SDL_BindGPUFragmentSamplers(rpass, 0, samplers, 4);
+                last_t0 = t0;
+                last_s0 = q.sampler0;
+                last_t1 = t1;
+                last_s1 = q.sampler1;
+                last_water = q.water_scene;
+            }
+
+            const uint64_t constant_key = q.constant_color | (uint64_t{q.constant_alpha} << 32);
+            if (constant_key != last_constant_color) {
+                const uint32_t color = q.constant_color;
+                const float alpha = ((color >> 24u) & 255u) / 255.0f;
+                SDL_FColor blend_factor = {
+                    q.constant_alpha ? alpha : ((color >> 16u) & 255u) / 255.0f,
+                    q.constant_alpha ? alpha : ((color >> 8u) & 255u) / 255.0f,
+                    q.constant_alpha ? alpha : (color & 255u) / 255.0f,
+                    alpha
+                };
+                SDL_SetGPUBlendConstants(rpass, blend_factor);
+                last_constant_color = constant_key;
+            }
+
+            const SDL_GPUViewport &want = q.viewport.w > 0.0f ? q.viewport : viewport;
+            if (std::memcmp(&want, &last_viewport, sizeof want) != 0) {
+                SDL_SetGPUViewport(rpass, &want);
+                last_viewport = want;
+            }
+
+            if (q.stencil_ref != last_stencil_ref) {
+                SDL_SetGPUStencilReference(rpass, q.stencil_ref);
+                last_stencil_ref = q.stencil_ref;
+            }
+
+            SDL_DrawGPUIndexedPrimitives(rpass, q.index_count, 1, 0, q.base_vertex, 0);
+        }
+        SDL_EndGPURenderPass(rpass);
+    }
+
+    // Modern water's single-sample depth: the depth-writing draws again, without color.
+    SDL_GPUDepthStencilTargetInfo water_info{};
+    water_info.texture = presenter->water_depth;
+    water_info.load_op = SDL_GPU_LOADOP_LOAD;
+    water_info.store_op = SDL_GPU_STOREOP_STORE;
+    water_info.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+    water_info.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+    SDL_GPURenderPass *water_pass = seg.water_depth_pending
+        ? SDL_BeginGPURenderPass(cmdbuf, nullptr, 0, &water_info) : nullptr;
+    if (water_pass) {
+        const SDL_GPUViewport full{0.0f, 0.0f, seg.target_w, seg.target_h, 0.0f, 1.0f};
+        const SDL_Rect scissor{0, 0, static_cast<int>(seg.target_w), static_cast<int>(seg.target_h)};
+        SDL_SetGPUScissor(water_pass, &scissor);
+        for (const QueuedDraw &q : seg.draws) {
+            if (!q.water_depth_pipeline) continue;
+            SDL_BindGPUGraphicsPipeline(water_pass, q.water_depth_pipeline);
+            const SDL_GPUBufferBinding vbinding{presenter->draw_vertex_buffer, seg_v_base + q.vertex_offset};
+            SDL_BindGPUVertexBuffers(water_pass, 0, &vbinding, 1);
+            const SDL_GPUBufferBinding ibinding{presenter->draw_index_buffer, seg_i_base + q.index_offset};
+            SDL_BindGPUIndexBuffer(water_pass, &ibinding, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+            SDL_PushGPUVertexUniformData(cmdbuf, 0, &seg.uniform_data[q.uniform_offset], q.vs_uniform_size * sizeof(float));
+            if (q.program_offset != kNoProgramConstants) {
+                SDL_PushGPUVertexUniformData(cmdbuf, 1, &seg.uniform_data[q.program_offset], kProgramConstantFloats * sizeof(float));
+            }
+            SDL_PushGPUFragmentUniformData(cmdbuf, 0, &seg.uniform_data[q.uniform_offset], q.fs_uniform_size * sizeof(float));
+            // Alpha-tested draws still need their textures; the scene slots must not bind water_depth.
+            const SDL_GPUTextureSamplerBinding samplers[4] = {
+                {q.texture ? q.texture : presenter->dummy_texture, q.sampler0},
+                {q.mask_texture ? q.mask_texture : presenter->dummy_texture, q.sampler1},
+                {presenter->dummy_texture, presenter->filter_sampler},
+                {presenter->dummy_texture, presenter->point_sampler}
+            };
+            SDL_BindGPUFragmentSamplers(water_pass, 0, samplers, 4);
+            SDL_SetGPUViewport(water_pass, q.viewport.w > 0.0f ? &q.viewport : &full);
+            SDL_DrawGPUIndexedPrimitives(water_pass, q.index_count, 1, 0, q.base_vertex, 0);
+        }
+        SDL_EndGPURenderPass(water_pass);
+    }
+
+    presenter->draw_vertex_used = seg_v_base + seg_v_bytes;
+    presenter->draw_index_used = seg_i_base + seg_i_bytes;
+
+    seg.draws.clear();
+    seg.vertex_data.clear();
+    seg.index_data.clear();
+    seg.uniform_data.clear();
+    seg.water_depth_pending = false;
+    releaseRetiredTextures(presenter);
+}
+
+struct MainTextures {
+    SDL_GPUTexture *color = nullptr, *depth = nullptr, *resolve = nullptr, *copy = nullptr, *front = nullptr;
+    uint32_t copy_levels = 1u;
+};
+
+void releaseMainTextures(SDL_GPUDevice *device, MainTextures &t)
+{
+    if (t.color) SDL_ReleaseGPUTexture(device, t.color);
+    if (t.depth) SDL_ReleaseGPUTexture(device, t.depth);
+    if (t.resolve && t.resolve != t.color) SDL_ReleaseGPUTexture(device, t.resolve);
+    if (t.copy) SDL_ReleaseGPUTexture(device, t.copy);
+    if (t.front) SDL_ReleaseGPUTexture(device, t.front);
+    t = {};
+}
+
+// The main picture's targets at one size; mips keep a guest downsample of an upscaled copy smooth.
+bool createMainTextures(SDL_GPUDevice *device, uint32_t main_w, uint32_t main_h,
+    SDL_GPUTextureFormat depth_format, SDL_GPUSampleCount sample_count, bool mips, MainTextures &out)
+{
+    SDL_GPUTextureCreateInfo color_info{};
+    color_info.type = SDL_GPU_TEXTURETYPE_2D;
+    color_info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    color_info.usage = (sample_count == SDL_GPU_SAMPLECOUNT_1)
+        ? (SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER)
+        : SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    color_info.width = main_w;
+    color_info.height = main_h;
+    color_info.layer_count_or_depth = 1;
+    color_info.num_levels = 1;
+    color_info.sample_count = sample_count;
+    SDL_GPUTexture *backbuffer_color = SDL_CreateGPUTexture(device, &color_info);
+
+    SDL_GPUTextureCreateInfo depth_info{};
+    depth_info.type = SDL_GPU_TEXTURETYPE_2D;
+    depth_info.format = depth_format;
+    depth_info.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    depth_info.width = main_w;
+    depth_info.height = main_h;
+    depth_info.layer_count_or_depth = 1;
+    depth_info.num_levels = 1;
+    depth_info.sample_count = sample_count;
+    SDL_GPUTexture *backbuffer_depth = SDL_CreateGPUTexture(device, &depth_info);
+
+    SDL_GPUTexture *backbuffer_resolve = nullptr;
+    if (sample_count == SDL_GPU_SAMPLECOUNT_1) {
+        backbuffer_resolve = backbuffer_color;
+    } else {
+        SDL_GPUTextureCreateInfo resolve_info{};
+        resolve_info.type = SDL_GPU_TEXTURETYPE_2D;
+        resolve_info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+        resolve_info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        resolve_info.width = main_w;
+        resolve_info.height = main_h;
+        resolve_info.layer_count_or_depth = 1;
+        resolve_info.num_levels = 1;
+        resolve_info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        backbuffer_resolve = SDL_CreateGPUTexture(device, &resolve_info);
+    }
+
+    SDL_GPUTextureCreateInfo copy_info{};
+    copy_info.type = SDL_GPU_TEXTURETYPE_2D;
+    copy_info.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    /* An upscaled copy keeps mips so a guest downsample (the 256x256
+       depth-of-field source) averages its footprint like the Xbox did. */
+    const uint32_t copy_levels = mips ? mipLevels(main_w, main_h) : 1u;
+    copy_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER |
+        (copy_levels > 1u ? SDL_GPU_TEXTUREUSAGE_COLOR_TARGET : 0u);
+    copy_info.width = main_w;
+    copy_info.height = main_h;
+    copy_info.layer_count_or_depth = 1;
+    copy_info.num_levels = copy_levels;
+    SDL_GPUTexture *backbuffer_copy = SDL_CreateGPUTexture(device, &copy_info);
+    SDL_GPUTexture *frontbuffer_copy = SDL_CreateGPUTexture(device, &copy_info);
+
+    out = {backbuffer_color, backbuffer_depth, backbuffer_resolve, backbuffer_copy, frontbuffer_copy, copy_levels};
+    if (backbuffer_color && backbuffer_depth && backbuffer_resolve && backbuffer_copy && frontbuffer_copy) return true;
+    releaseMainTextures(device, out);
+    return false;
+}
+
+/* A new shape rebuilds what is sized to the main picture on the same window and
+   device. The guest's own targets go too; the reboot that changes the shape draws them anew. */
+RecompD3dPresenterError submitShape(RecompD3dPresenter *p, const RecompD3dPresenterShapeCommand &shape)
+{
+    if (shape.widescreen && (shape.aspect_w == 0u || shape.aspect_h == 0u)) {
+        return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    }
+    // A failed rebuild left no textures: rebuild even for the shape already stored.
+    const bool built = p->backbuffer_color != nullptr;
+    if (built && shape.widescreen == p->widescreen &&
+        (!shape.widescreen || (shape.aspect_w == p->aspect_w && shape.aspect_h == p->aspect_h))) {
+        return RECOMP_D3D_PRESENTER_OK;
+    }
+    const uint32_t old_w = mainWidth(p), old_h = mainHeight(p);
+    p->widescreen = shape.widescreen;
+    if (shape.widescreen) {
+        p->aspect_w = shape.aspect_w;
+        p->aspect_h = shape.aspect_h;
+    }
+    // Present and draws read the shape live; the textures only follow the main size (fixed at scale 1).
+    if (built && mainWidth(p) == old_w && mainHeight(p) == old_h) return RECOMP_D3D_PRESENTER_OK;
+    flushSegment(p);
+    if (p->current_command_buffer) {
+        SDL_SubmitGPUCommandBuffer(p->current_command_buffer);
+        p->current_command_buffer = nullptr;
+    }
+    MainTextures old{p->backbuffer_color, p->backbuffer_depth, p->backbuffer_resolve,
+        p->backbuffer_copy, p->frontbuffer_copy};
+    releaseMainTextures(p->device, old);
+    p->backbuffer_color = p->backbuffer_depth = p->backbuffer_resolve = nullptr;
+    p->backbuffer_copy = p->frontbuffer_copy = nullptr;
+    p->segment.target_color = p->segment.target_depth = nullptr;
+    for (SDL_GPUTexture **texture : {&p->present_texture, &p->water_color, &p->water_depth, &p->gamma_target}) {
+        if (*texture) SDL_ReleaseGPUTexture(p->device, *texture);
+        *texture = nullptr;
+    }
+    if (p->gamma_pipeline) SDL_ReleaseGPUGraphicsPipeline(p->device, p->gamma_pipeline);
+    p->gamma_pipeline = nullptr;  // ensureGammaPass builds it again with its target
+    for (auto &rt : p->render_targets) {
+        if (rt.texture) SDL_ReleaseGPUTexture(p->device, rt.texture);
+    }
+    p->render_targets.clear();
+    for (auto &dt : p->depth_targets) {
+        if (dt.texture) SDL_ReleaseGPUTexture(p->device, dt.texture);
+    }
+    p->depth_targets.clear();
+    p->target_bytes = 0u;
+    p->present_texture_failed = false;
+    p->water_present = p->water_copy_present = UINT32_MAX;
+    p->water_depth_live = false;
+    p->frontbuffer_used = false;
+    p->backbuffer_resolved = false;
+
+    MainTextures created;
+    if (!createMainTextures(p->device, mainWidth(p), mainHeight(p), p->depth_format, p->msaa_samples, p->scale != 1.0f, created)) {
+        std::fprintf(stderr, "[presenter] shape change failed: %s\n", SDL_GetError());
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+    p->backbuffer_color = created.color;
+    p->backbuffer_depth = created.depth;
+    p->backbuffer_resolve = created.resolve;
+    p->backbuffer_copy = created.copy;
+    p->frontbuffer_copy = created.front;
+    p->copy_mips = created.copy_levels > 1u;
+    // PRESENT draws into gamma_target whenever a ramp is on; only GAMMA would rebuild it.
+    if (p->gamma_enabled && !ensureGammaPass(p)) {
+        p->gamma_enabled = false;  // PRESENT branches on it alone; show the picture without the ramp
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+    std::fprintf(stderr, "[presenter] shape %s resolution=%ux%u\n",
+        shape.widescreen ? "wide" : "4:3", mainWidth(p), mainHeight(p));
+    return RECOMP_D3D_PRESENTER_OK;
+}
+} // namespace
+
+// Saves the game's frame as shown (after gamma), without the overlay drawn on
+// the window, and submits the command buffer. The download waits for the GPU,
+// so only a requested screenshot pays for it.
+static void saveScreenshot(RecompD3dPresenter *presenter, SDL_GPUCommandBuffer *cmdbuf, SDL_GPUTexture *frame) {
+    const uint32_t w = mainWidth(presenter), h = mainHeight(presenter);
+    SDL_GPUTransferBufferCreateInfo info{SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, w * h * 4u, 0};
+    SDL_GPUTransferBuffer *buffer = SDL_CreateGPUTransferBuffer(presenter->device, &info);
+    if (buffer == nullptr) {
+        std::fprintf(stderr, "recomp screenshot: %s\n", SDL_GetError());
+        SDL_SubmitGPUCommandBuffer(cmdbuf);
+        return;
+    }
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmdbuf);
+    SDL_GPUTextureRegion source{frame, 0, 0, 0, 0, 0, w, h, 1};
+    SDL_GPUTextureTransferInfo destination{buffer, 0, w, h};
+    SDL_DownloadFromGPUTexture(copy, &source, &destination);
+    SDL_EndGPUCopyPass(copy);
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmdbuf);
+    bool saved = false;
+    if (fence != nullptr) {
+        SDL_WaitForGPUFences(presenter->device, true, &fence, 1);
+        SDL_ReleaseGPUFence(presenter->device, fence);
+        if (void *pixels = SDL_MapGPUTransferBuffer(presenter->device, buffer, false)) {
+            recomp_screenshot_save(static_cast<const uint8_t *>(pixels), w, h, w * 4u);
+            saved = true;
+            SDL_UnmapGPUTransferBuffer(presenter->device, buffer);
+        }
+    }
+    if (!saved) std::fprintf(stderr, "recomp screenshot: %s\n", SDL_GetError());
+    SDL_ReleaseGPUTransferBuffer(presenter->device, buffer);
+}
+
+extern "C" {
+
+RecompD3dPresenterError recomp_d3d_presenter_create(
+    const RecompD3dPresenterConfig *config,
+    RecompD3dPresenter **presenter)
+{
+    if (config == nullptr || presenter == nullptr) {
+        return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    }
+    if (config->width == 0u || config->height == 0u ||
+        config->color_format != RECOMP_D3D_PRESENTER_COLOR_FORMAT_BGRA8_UNORM ||
+        config->depth_format != RECOMP_D3D_PRESENTER_DEPTH_FORMAT_D24S8) {
+        return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    }
+    if (*presenter != nullptr || active_presenter != nullptr) {
+        return RECOMP_D3D_PRESENTER_ALREADY_INITIALIZED;
+    }
+
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+        std::fprintf(stderr, "[presenter] SDL init video failed: %s\n", SDL_GetError());
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+
+#ifdef _WIN32
+    // SPIR-V alone selects Vulkan; Direct3D 12 would need DXIL.
+    const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_SPIRV;
+#else
+    const SDL_GPUShaderFormat formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_SPIRV;
+#endif
+    SDL_GPUDevice *device = SDL_CreateGPUDevice(formats, false, nullptr);
+    if (!device) {
+        std::fprintf(stderr, "[presenter] SDL create GPU device failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+
+    float scale = 1.0f;
+    if (const char *scale_env = std::getenv("RECOMP_D3D_SCALE")) {
+        const float val = static_cast<float>(std::atof(scale_env));
+        if (std::isfinite(val) && val >= 1.0f) {
+            scale = std::clamp(val, 1.0f, 8.0f);
+        }
+    }
+    /* DOA3 renders 4:3 unless RECOMP_D3D_WIDESCREEN sets the Xbox widescreen flag. */
+    unsigned aspect_w = 16u, aspect_h = 9u;
+    const bool widescreen = recomp_widescreen(&aspect_w, &aspect_h);
+
+    const uint32_t main_h = static_cast<uint32_t>(config->height * scale + 0.5f);
+    // The window shows the display aspect; at scale 1 the main target keeps
+    // the guest width, anamorphic when widescreen.
+    const uint32_t display_w = widescreen
+        ? (main_h * aspect_w + aspect_h - 1u) / aspect_h : (main_h * 4u + 1u) / 3u;
+    const uint32_t main_w = scale == 1.0f ? config->width : display_w;
+
+    uint32_t win_w = display_w;
+    uint32_t win_h = main_h;
+    SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(display);
+    if (mode && mode->w > 0 && mode->h > 0) {
+        uint32_t max_w = static_cast<uint32_t>(mode->w);
+        uint32_t max_h = static_cast<uint32_t>(mode->h > 80 ? mode->h - 80 : mode->h);
+        if (win_w > max_w || win_h > max_h) {
+            float aspect = static_cast<float>(display_w) / main_h;
+            if (win_w > max_w) {
+                win_w = max_w;
+                win_h = static_cast<uint32_t>(win_w / aspect + 0.5f);
+            }
+            if (win_h > max_h) {
+                win_h = max_h;
+                win_w = static_cast<uint32_t>(win_h * aspect + 0.5f);
+            }
+        }
+    }
+
+    const bool headless = std::getenv("RECOMP_HEADLESS") != nullptr;
+    // Steam sets these in Game Mode and on the Deck, where gamescope would
+    // only letterbox a window.
+    const auto steam_flag = [](const char *name) {
+        const char *value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    bool fullscreen = steam_flag("SteamTenfoot") || steam_flag("SteamDeck") ||
+                      projecttenshin::vulkan::fullscreen_requested();
+#ifdef _WIN32
+    // As with Direct3D 11, a scaled window covers the primary screen.
+    fullscreen = fullscreen || scale != 1.0f;
+#endif
+    SDL_WindowFlags win_flags = SDL_WINDOW_RESIZABLE;
+    if (headless) {
+        win_flags |= SDL_WINDOW_HIDDEN;
+    } else if (fullscreen) {
+        win_flags |= SDL_WINDOW_FULLSCREEN;
+    }
+
+    SDL_Window *window = SDL_CreateWindow(
+        "ProjectTenshin — Dead or Alive 3++", win_w, win_h, win_flags);
+    if (!window || !SDL_ClaimWindowForGPUDevice(device, window)) {
+        std::fprintf(stderr, "[presenter] SDL create/claim window failed: %s\n", SDL_GetError());
+        if (window) SDL_DestroyWindow(window);
+        SDL_DestroyGPUDevice(device);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+    // Take the focus from the launcher: an unfocused window gets no pad input.
+    if (!headless) SDL_RaiseWindow(window);
+    SDL_StartTextInput(window); // netplay menu text
+
+    SDL_GPUPresentMode present_mode = SDL_GPU_PRESENTMODE_VSYNC;
+    if (preferMailbox(immediate_present_setting) &&
+        SDL_WindowSupportsGPUPresentMode(device, window, SDL_GPU_PRESENTMODE_MAILBOX)) {
+        present_mode = SDL_GPU_PRESENTMODE_MAILBOX;
+    }
+    SDL_SetGPUSwapchainParameters(
+        device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, present_mode);
+
+    // Select depth-stencil format. On Qualcomm Adreno (Freedreno/Turnip),
+    // D24_UNORM_S8_UINT matches the Xbox NV2A natively and runs on Adreno's
+    // UBWC/LRZ tiled fast-path; D32_FLOAT_S8_UINT remains the default elsewhere.
+    const auto freedreno = projecttenshin::vulkan::probe_freedreno_environment();
+    const auto depth_pref = projecttenshin::vulkan::parse_depth_preference(
+        std::getenv("RECOMP_VK_DEPTH_FORMAT"));
+    const bool has_d24s8 = SDL_GPUTextureSupportsFormat(
+        device, SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT,
+        SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
+    const bool has_d32s8 = SDL_GPUTextureSupportsFormat(
+        device, SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT,
+        SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
+    SDL_GPUTextureFormat depth_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT;
+    if (depth_pref == projecttenshin::vulkan::DepthPreference::PreferD24S8 && has_d24s8) {
+        depth_format = SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
+    } else if (depth_pref == projecttenshin::vulkan::DepthPreference::Auto &&
+               (freedreno.freedreno_icd_found || freedreno.is_snapdragon || !has_d32s8) && has_d24s8) {
+        depth_format = SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
+    } else if (!has_d32s8 && has_d24s8) {
+        depth_format = SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
+    }
+
+    const bool a8_supported = SDL_GPUTextureSupportsFormat(
+        device, SDL_GPU_TEXTUREFORMAT_A8_UNORM,
+        SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    const bool simple_water = projecttenshin::vulkan::simple_water_requested();
+
+    uint32_t msaa_count = 1u;
+    SDL_GPUSampleCount sample_count = SDL_GPU_SAMPLECOUNT_1;
+    if (const char *msaa_env = std::getenv("RECOMP_D3D_MSAA")) {
+        const int requested = std::atoi(msaa_env);
+        if (requested >= 8 && SDL_GPUTextureSupportsSampleCount(device, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, SDL_GPU_SAMPLECOUNT_8) &&
+                              SDL_GPUTextureSupportsSampleCount(device, depth_format, SDL_GPU_SAMPLECOUNT_8)) {
+            msaa_count = 8u;
+            sample_count = SDL_GPU_SAMPLECOUNT_8;
+        } else if (requested >= 4 && SDL_GPUTextureSupportsSampleCount(device, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, SDL_GPU_SAMPLECOUNT_4) &&
+                                     SDL_GPUTextureSupportsSampleCount(device, depth_format, SDL_GPU_SAMPLECOUNT_4)) {
+            msaa_count = 4u;
+            sample_count = SDL_GPU_SAMPLECOUNT_4;
+        } else if (requested >= 2 && SDL_GPUTextureSupportsSampleCount(device, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, SDL_GPU_SAMPLECOUNT_2) &&
+                                     SDL_GPUTextureSupportsSampleCount(device, depth_format, SDL_GPU_SAMPLECOUNT_2)) {
+            msaa_count = 2u;
+            sample_count = SDL_GPU_SAMPLECOUNT_2;
+        }
+    }
+
+    MainTextures main_textures;
+    if (!createMainTextures(device, main_w, main_h, depth_format, sample_count, scale != 1.0f, main_textures)) {
+        SDL_ReleaseWindowFromGPUDevice(device, window);
+        SDL_DestroyWindow(window);
+        SDL_DestroyGPUDevice(device);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+    SDL_GPUTexture *backbuffer_color = main_textures.color;
+    SDL_GPUTexture *backbuffer_depth = main_textures.depth;
+    SDL_GPUTexture *backbuffer_resolve = main_textures.resolve;
+    SDL_GPUTexture *backbuffer_copy = main_textures.copy;
+    SDL_GPUTexture *frontbuffer_copy = main_textures.front;
+    const uint32_t copy_levels = main_textures.copy_levels;
+
+    // Dummy texture (1x1 white)
+    SDL_GPUTextureCreateInfo dummy_info{};
+    dummy_info.type = SDL_GPU_TEXTURETYPE_2D;
+    dummy_info.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    dummy_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    dummy_info.width = 1;
+    dummy_info.height = 1;
+    dummy_info.layer_count_or_depth = 1;
+    dummy_info.num_levels = 1;
+    SDL_GPUTexture *dummy_texture = SDL_CreateGPUTexture(device, &dummy_info);
+    if (dummy_texture) {
+        uint32_t white_pixel = 0xffffffffu;
+        SDL_GPUTransferBufferCreateInfo tbuf_info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, sizeof(white_pixel), 0};
+        SDL_GPUTransferBuffer *tbuf = SDL_CreateGPUTransferBuffer(device, &tbuf_info);
+        if (tbuf) {
+            void *map = SDL_MapGPUTransferBuffer(device, tbuf, false);
+            if (map) {
+                std::memcpy(map, &white_pixel, sizeof(white_pixel));
+                SDL_UnmapGPUTransferBuffer(device, tbuf);
+                SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(device);
+                SDL_GPUCopyPass *cpass = SDL_BeginGPUCopyPass(cmd);
+                if (cpass) {
+                    SDL_GPUTextureTransferInfo src{tbuf, 0, 1, 1};
+                    SDL_GPUTextureRegion dst{dummy_texture, 0, 0, 0, 0, 0, 1, 1, 1};
+                    SDL_UploadToGPUTexture(cpass, &src, &dst, false);
+                    SDL_EndGPUCopyPass(cpass);
+                }
+                SDL_SubmitGPUCommandBuffer(cmd);
+            }
+            SDL_ReleaseGPUTransferBuffer(device, tbuf);
+        }
+    }
+
+    // Samplers
+    SDL_GPUSamplerCreateInfo sampler_info{};
+    sampler_info.min_filter = SDL_GPU_FILTER_LINEAR;
+    sampler_info.mag_filter = SDL_GPU_FILTER_LINEAR;
+    sampler_info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    sampler_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.max_lod = 1000.0f;  // the zero default would sample only the base mip level
+    SDL_GPUSampler *filter_sampler = SDL_CreateGPUSampler(device, &sampler_info);
+
+    sampler_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sampler_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    sampler_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    SDL_GPUSampler *program_mask_sampler = SDL_CreateGPUSampler(device, &sampler_info);
+
+    sampler_info.min_filter = SDL_GPU_FILTER_NEAREST;
+    sampler_info.mag_filter = SDL_GPU_FILTER_NEAREST;
+    sampler_info.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    sampler_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    sampler_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    SDL_GPUSampler *point_sampler = SDL_CreateGPUSampler(device, &sampler_info);
+
+    // Initial dynamic ring buffers
+    SDL_GPUBufferCreateInfo vb_info{SDL_GPU_BUFFERUSAGE_VERTEX, kInitialVertexCapacity, 0};
+    SDL_GPUBuffer *vb = SDL_CreateGPUBuffer(device, &vb_info);
+    SDL_GPUBufferCreateInfo ib_info{SDL_GPU_BUFFERUSAGE_INDEX, kInitialIndexCapacity, 0};
+    SDL_GPUBuffer *ib = SDL_CreateGPUBuffer(device, &ib_info);
+
+    SDL_GPUTransferBufferCreateInfo vtb_info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, kInitialVertexCapacity, 0};
+    SDL_GPUTransferBuffer *vtb = SDL_CreateGPUTransferBuffer(device, &vtb_info);
+    SDL_GPUTransferBufferCreateInfo itb_info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, kInitialIndexCapacity, 0};
+    SDL_GPUTransferBuffer *itb = SDL_CreateGPUTransferBuffer(device, &itb_info);
+
+    if (!vb || !ib || !vtb || !itb || !dummy_texture ||
+        !filter_sampler || !program_mask_sampler || !point_sampler) {
+        if (vb) SDL_ReleaseGPUBuffer(device, vb);
+        if (ib) SDL_ReleaseGPUBuffer(device, ib);
+        if (vtb) SDL_ReleaseGPUTransferBuffer(device, vtb);
+        if (itb) SDL_ReleaseGPUTransferBuffer(device, itb);
+        if (filter_sampler) SDL_ReleaseGPUSampler(device, filter_sampler);
+        if (point_sampler) SDL_ReleaseGPUSampler(device, point_sampler);
+        if (program_mask_sampler) SDL_ReleaseGPUSampler(device, program_mask_sampler);
+        if (dummy_texture) SDL_ReleaseGPUTexture(device, dummy_texture);
+        SDL_ReleaseGPUTexture(device, backbuffer_color);
+        SDL_ReleaseGPUTexture(device, backbuffer_depth);
+        if (backbuffer_resolve && backbuffer_resolve != backbuffer_color) SDL_ReleaseGPUTexture(device, backbuffer_resolve);
+        SDL_ReleaseGPUTexture(device, backbuffer_copy);
+        SDL_ReleaseGPUTexture(device, frontbuffer_copy);
+        SDL_ReleaseWindowFromGPUDevice(device, window);
+        SDL_DestroyWindow(window);
+        SDL_DestroyGPUDevice(device);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+    }
+
+    auto *p = new (std::nothrow) RecompD3dPresenter();
+    if (!p) {
+        SDL_ReleaseGPUBuffer(device, vb);
+        SDL_ReleaseGPUBuffer(device, ib);
+        SDL_ReleaseGPUTransferBuffer(device, vtb);
+        SDL_ReleaseGPUTransferBuffer(device, itb);
+        SDL_ReleaseGPUSampler(device, filter_sampler);
+        SDL_ReleaseGPUSampler(device, point_sampler);
+        SDL_ReleaseGPUSampler(device, program_mask_sampler);
+        if (dummy_texture) SDL_ReleaseGPUTexture(device, dummy_texture);
+        SDL_ReleaseGPUTexture(device, backbuffer_color);
+        SDL_ReleaseGPUTexture(device, backbuffer_depth);
+        if (backbuffer_resolve && backbuffer_resolve != backbuffer_color) SDL_ReleaseGPUTexture(device, backbuffer_resolve);
+        SDL_ReleaseGPUTexture(device, backbuffer_copy);
+        SDL_ReleaseGPUTexture(device, frontbuffer_copy);
+        SDL_ReleaseWindowFromGPUDevice(device, window);
+        SDL_DestroyWindow(window);
+        SDL_DestroyGPUDevice(device);
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return RECOMP_D3D_PRESENTER_OUT_OF_MEMORY;
+    }
+
+    p->config = *config;
+    p->scale = scale;
+    p->widescreen = widescreen;
+    p->aspect_w = aspect_w;
+    p->aspect_h = aspect_h;
+    p->use_spirv = (SDL_GetGPUShaderFormats(device) & SDL_GPU_SHADERFORMAT_SPIRV) != 0;
+    p->depth_format = depth_format;
+    p->a8_supported = a8_supported;
+    p->simple_water = simple_water;
+    p->owner_thread = std::this_thread::get_id();
+    const char *performance = std::getenv("RECOMP_PERF_COUNTER");
+    p->performance_counter = performance != nullptr && std::strcmp(performance, "1") == 0;
+    p->window = window;
+    p->device = device;
+    p->backbuffer_color = backbuffer_color;
+    p->backbuffer_depth = backbuffer_depth;
+    p->backbuffer_resolve = backbuffer_resolve;
+    p->backbuffer_copy = backbuffer_copy;
+    p->frontbuffer_copy = frontbuffer_copy;
+    p->copy_mips = copy_levels > 1u;
+    p->dummy_texture = dummy_texture;
+    p->msaa_count = msaa_count;
+    p->msaa_samples = sample_count;
+    p->filter_sampler = filter_sampler;
+    p->point_sampler = point_sampler;
+    p->program_mask_sampler = program_mask_sampler;
+    p->draw_vertex_buffer = vb;
+    p->draw_index_buffer = ib;
+    p->draw_vertex_transfer = vtb;
+    p->draw_index_transfer = itb;
+
+    std::fprintf(stderr,
+        "[presenter] initialized driver=%s scale=%.2f resolution=%ux%u window=%ux%u widescreen=%d msaa=%ux depth=%s a8=%d water=%s freedreno=%d\n",
+        SDL_GetGPUDeviceDriver(device), scale, main_w, main_h, win_w, win_h, widescreen ? 1 : 0, msaa_count,
+        depth_format == SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT ? "d24s8" : "d32s8",
+        a8_supported ? 1 : 0, simple_water ? "simple" : "modern",
+        freedreno.freedreno_icd_found ? 1 : 0);
+
+    try {
+        p->precompile_thread = std::thread(precompileBootShaders, p);
+    } catch (const std::system_error &) {
+    }
+
+    active_presenter = p;
+    *presenter = p;
+    return RECOMP_D3D_PRESENTER_OK;
+}
+
+RecompD3dPresenterError recomp_d3d_presenter_submit(
+    RecompD3dPresenter *presenter,
+    const RecompD3dPresenterCommand *command)
+{
+    if (presenter == nullptr || presenter != active_presenter) {
+        return RECOMP_D3D_PRESENTER_NOT_INITIALIZED;
+    }
+    if (std::this_thread::get_id() != presenter->owner_thread) {
+        return RECOMP_D3D_PRESENTER_WRONG_THREAD;
+    }
+    // Events are pumped once per present; pumping per draw costs a syscall
+    // round trip on X11/Wayland for each of the game's ~1500 draws a frame.
+    if (presenter->close_requested) {
+        return RECOMP_D3D_PRESENTER_CLOSED;
+    }
+    if (command == nullptr) {
+        return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    }
+
+    switch (command->type) {
+    case RECOMP_D3D_PRESENTER_COMMAND_CLEAR: {
+        const auto &clear = command->data.clear;
+        if (clear.clear_depth && (!std::isfinite(clear.z) || clear.z < 0.0f || clear.z > 1.0f)) {
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+
+        flushSegment(presenter);
+
+        SDL_GPUTexture *target_color = presenter->backbuffer_color;
+        uint32_t color_w = mainWidth(presenter);
+        uint32_t color_h = mainHeight(presenter);
+
+        if (clear.target.offscreen) {
+            color_w = clear.target.color.width;
+            color_h = clear.target.color.height;
+            RenderTargetEntry *rt = nullptr;
+            const RecompD3dPresenterError error = findOrCreateRenderTarget(presenter, clear.target.color, rt);
+            if (error != RECOMP_D3D_PRESENTER_OK) return error;
+            target_color = rt->texture;
+        }
+        SDL_GPUTexture *target_depth = lookupDepthTarget(presenter, clear.target);
+
+        SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+        SDL_GPUColorTargetInfo color_info{};
+        color_info.texture = target_color;
+        const bool is_main = (target_color == presenter->backbuffer_color);
+        color_info.store_op = SDL_GPU_STOREOP_STORE;
+        if (is_main) {
+            presenter->backbuffer_resolved = false;
+        }
+        if (clear.clear_color) {
+            color_info.load_op = SDL_GPU_LOADOP_CLEAR;
+            constexpr float b2f = 1.0f / 255.0f;
+            color_info.clear_color.r = static_cast<float>((clear.color >> 16u) & 0xffu) * b2f;
+            color_info.clear_color.g = static_cast<float>((clear.color >> 8u) & 0xffu) * b2f;
+            color_info.clear_color.b = static_cast<float>(clear.color & 0xffu) * b2f;
+            color_info.clear_color.a = static_cast<float>((clear.color >> 24u) & 0xffu) * b2f;
+        } else {
+            color_info.load_op = SDL_GPU_LOADOP_LOAD;
+        }
+
+        SDL_GPUDepthStencilTargetInfo depth_info{};
+        const bool use_depth = (target_depth != nullptr) && (clear.clear_depth || clear.clear_stencil);
+        if (use_depth) {
+            depth_info.texture = target_depth;
+            depth_info.load_op = clear.clear_depth ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+            depth_info.store_op = SDL_GPU_STOREOP_STORE;
+            depth_info.clear_depth = clear.z;
+            depth_info.stencil_load_op = clear.clear_stencil ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+            depth_info.stencil_store_op = SDL_GPU_STOREOP_STORE;
+            depth_info.clear_stencil = static_cast<Uint8>(clear.stencil);
+        }
+
+        SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmdbuf, &color_info, 1, use_depth ? &depth_info : nullptr);
+        if (pass) SDL_EndGPURenderPass(pass);
+        // Modern water's single-sample depth follows the main depth's clears.
+        if (is_main && target_depth == presenter->backbuffer_depth && clear.clear_depth) {
+            presenter->water_depth_live = waterDepthWanted(presenter) && ensureWaterTargets(presenter);
+            SDL_GPUDepthStencilTargetInfo water_info{};
+            water_info.texture = presenter->water_depth;
+            water_info.clear_depth = clear.z;
+            water_info.load_op = SDL_GPU_LOADOP_CLEAR;
+            water_info.store_op = SDL_GPU_STOREOP_STORE;
+            water_info.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+            water_info.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+            SDL_GPURenderPass *water_pass = presenter->water_depth_live
+                ? SDL_BeginGPURenderPass(cmdbuf, nullptr, 0, &water_info) : nullptr;
+            if (water_pass) SDL_EndGPURenderPass(water_pass);
+        }
+        return RECOMP_D3D_PRESENTER_OK;
+    }
+
+    case RECOMP_D3D_PRESENTER_COMMAND_PRESENT: {
+        const auto &present = command->data.present;
+        if (present.effective_flags != 5u || present.swap_counter == 0u) {
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+
+        flushSegment(presenter);
+        ensureBackbufferResolved(presenter);
+
+        pumpEvents(presenter);
+        if (presenter->close_requested) {
+            return RECOMP_D3D_PRESENTER_CLOSED;
+        }
+
+        SDL_GPUCommandBuffer *cmdbuf = getCommandBuffer(presenter);
+        SDL_GPUTexture *shown = presenter->backbuffer_resolve;
+        if (presenter->gamma_enabled) {
+            SDL_GPUColorTargetInfo gamma_target{};
+            gamma_target.texture = presenter->gamma_target;
+            gamma_target.load_op = SDL_GPU_LOADOP_DONT_CARE;
+            gamma_target.store_op = SDL_GPU_STOREOP_STORE;
+            if (SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmdbuf, &gamma_target, 1, nullptr)) {
+                SDL_BindGPUGraphicsPipeline(pass, presenter->gamma_pipeline);
+                const SDL_GPUTextureSamplerBinding pixels{presenter->backbuffer_resolve, presenter->point_sampler};
+                SDL_BindGPUFragmentSamplers(pass, 0, &pixels, 1);
+                SDL_PushGPUFragmentUniformData(cmdbuf, 0, presenter->gamma_ramp, sizeof presenter->gamma_ramp);
+                SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
+                SDL_EndGPURenderPass(pass);
+                shown = presenter->gamma_target;
+            }
+        }
+        SDL_GPUTexture *swapchain_tex = nullptr;
+        Uint32 swap_w = 0, swap_h = 0;
+        if (SDL_WaitAndAcquireGPUSwapchainTexture(
+                cmdbuf, presenter->window, &swapchain_tex, &swap_w, &swap_h)) {
+            if (swapchain_tex && swap_w > 0 && swap_h > 0) {
+                SDL_GPUBlitInfo blit{};
+                blit.destination.texture = swapchain_tex;
+
+                const float src_aspect = static_cast<float>(
+                    presentClientWidth(presenter, mainHeight(presenter))) / mainHeight(presenter);
+                const float dst_aspect = static_cast<float>(swap_w) / swap_h;
+                int dst_x = 0, dst_y = 0, dst_w = swap_w, dst_h = swap_h;
+                if (dst_aspect > src_aspect) {
+                    dst_w = static_cast<int>(swap_h * src_aspect + 0.5f);
+                    dst_x = (swap_w - dst_w) / 2;
+                } else {
+                    dst_h = static_cast<int>(swap_w / src_aspect + 0.5f);
+                    dst_y = (swap_h - dst_h) / 2;
+                }
+
+                /* A picture well above the window's size blits from the mip
+                   that matches it, built from a copy of what is shown. */
+                SDL_GPUTexture *source = shown;
+                uint32_t source_w = mainWidth(presenter), source_h = mainHeight(presenter);
+                uint32_t mip = presentMipLevel(source_w, source_h,
+                    static_cast<uint32_t>(dst_w), static_cast<uint32_t>(dst_h));
+                SDL_GPUCopyPass *mip_pass = mip != 0u && ensurePresentTexture(presenter)
+                    ? SDL_BeginGPUCopyPass(cmdbuf) : nullptr;
+                if (mip_pass != nullptr) {
+                    const SDL_GPUTextureLocation from{shown, 0, 0, 0, 0, 0};
+                    const SDL_GPUTextureLocation to{presenter->present_texture, 0, 0, 0, 0, 0};
+                    SDL_CopyGPUTextureToTexture(mip_pass, &from, &to, source_w, source_h, 1, false);
+                    SDL_EndGPUCopyPass(mip_pass);
+                    SDL_GenerateMipmapsForGPUTexture(cmdbuf, presenter->present_texture);
+                    source = presenter->present_texture;
+                    source_w = (std::max)(source_w >> mip, 1u);
+                    source_h = (std::max)(source_h >> mip, 1u);
+                } else {
+                    mip = 0u;
+                }
+                blit.source.texture = source;
+                blit.source.mip_level = mip;
+                blit.source.w = source_w;
+                blit.source.h = source_h;
+                blit.destination.x = dst_x;
+                blit.destination.y = dst_y;
+                blit.destination.w = dst_w;
+                blit.destination.h = dst_h;
+                blit.load_op = SDL_GPU_LOADOP_CLEAR;
+                blit.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
+                blit.filter = SDL_GPU_FILTER_LINEAR;
+                SDL_BlitGPUTexture(cmdbuf, &blit);
+                // The runtime's overlay text goes on the window, not the
+                // game's back buffer, which the game reads back as its front
+                // buffer.
+                RecompOverlayText overlay;
+                recomp_overlay_take(&overlay);
+                recomp_overlay_sdl_gpu_draw(presenter->device, presenter->window, cmdbuf,
+                    swapchain_tex, swap_w, swap_h, &overlay);
+            }
+        }
+
+        if (presenter->frontbuffer_copy && presenter->frontbuffer_used) {
+            SDL_GPUCopyPass *copypass = SDL_BeginGPUCopyPass(cmdbuf);
+            if (copypass) {
+                SDL_GPUTextureLocation src_loc{presenter->backbuffer_resolve, 0, 0, 0, 0};
+                SDL_GPUTextureLocation dst_loc{presenter->frontbuffer_copy, 0, 0, 0, 0};
+                SDL_CopyGPUTextureToTexture(copypass, &src_loc, &dst_loc, mainWidth(presenter), mainHeight(presenter), 1, false);
+                SDL_EndGPUCopyPass(copypass);
+                if (presenter->copy_mips) SDL_GenerateMipmapsForGPUTexture(cmdbuf, presenter->frontbuffer_copy);
+            }
+        }
+
+        char burst_path[1024];
+        const char *dump_path = frameDumpPath(presenter, presenter->present_count + 1u, burst_path);
+        SDL_GPUTransferBuffer *dump = nullptr;
+        const uint32_t dump_w = mainWidth(presenter), dump_h = mainHeight(presenter);
+        if (dump_path != nullptr) {
+            SDL_GPUTransferBufferCreateInfo info{};
+            info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+            info.size = dump_w * dump_h * 4u;
+            dump = SDL_CreateGPUTransferBuffer(presenter->device, &info);
+            SDL_GPUCopyPass *copypass = dump ? SDL_BeginGPUCopyPass(cmdbuf) : nullptr;
+            if (copypass) {
+                SDL_GPUTextureRegion region{};
+                region.texture = presenter->backbuffer_resolve;
+                region.w = dump_w;
+                region.h = dump_h;
+                region.d = 1;
+                SDL_GPUTextureTransferInfo destination{};
+                destination.transfer_buffer = dump;
+                SDL_DownloadFromGPUTexture(copypass, &region, &destination);
+                SDL_EndGPUCopyPass(copypass);
+            }
+        }
+        if (dump != nullptr) {
+            SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmdbuf);
+            if (fence) {
+                SDL_WaitForGPUFences(presenter->device, true, &fence, 1);
+                SDL_ReleaseGPUFence(presenter->device, fence);
+                if (const auto *pixels = static_cast<const uint8_t *>(
+                        SDL_MapGPUTransferBuffer(presenter->device, dump, false))) {
+                    writeBmp(dump_path, pixels, dump_w, dump_h);
+                    SDL_UnmapGPUTransferBuffer(presenter->device, dump);
+                    std::fprintf(stderr, "recomp d3d presenter: frame dump path=%s size=%ux%u present=%u\n",
+                        dump_path, dump_w, dump_h, presenter->present_count + 1u);
+                }
+            }
+            SDL_ReleaseGPUTransferBuffer(presenter->device, dump);
+        } else if (recomp_screenshot_take_request()) {
+            saveScreenshot(presenter, cmdbuf, shown);
+        } else {
+            SDL_SubmitGPUCommandBuffer(cmdbuf);
+        }
+        presenter->current_command_buffer = nullptr;
+        ++presenter->present_count;
+        presenter->water_depth_live = false;
+
+        if (presenter->performance_counter) reportPerformance(presenter);
+
+        return RECOMP_D3D_PRESENTER_OK;
+    }
+
+    case RECOMP_D3D_PRESENTER_COMMAND_DRAW: {
+        const auto &draw = command->data.draw;
+        if (draw.vertex_bytes == nullptr || draw.index_bytes == nullptr ||
+            draw.vertex_stride == 0u || draw.vertex_count == 0u ||
+            draw.index_count == 0u ||
+            static_cast<unsigned>(draw.cull_mode) > RECOMP_D3D_CULL_COUNTER_CLOCKWISE) {
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+
+        RecompD3dVertexLayout layout{};
+        if (!recomp_d3d_fvf_layout(draw.fvf, &layout) ||
+            layout.stride > draw.vertex_stride ||
+            (!layout.pretransformed && !draw.has_transform && !draw.program_count) ||
+            (draw.directional.enabled && !draw.program_count && draw.directional.count > 8u) ||
+            (draw.primitive_type == 2u && (draw.index_count < 2u || draw.index_count % 2u != 0u))) {
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+
+        // Determine destination target
+        SDL_GPUTexture *target_color = presenter->backbuffer_color;
+        uint32_t color_w = mainWidth(presenter);
+        uint32_t color_h = mainHeight(presenter);
+
+        if (draw.target.offscreen) {
+            color_w = draw.target.color.width;
+            color_h = draw.target.color.height;
+            RenderTargetEntry *rt = nullptr;
+            const RecompD3dPresenterError error = findOrCreateRenderTarget(presenter, draw.target.color, rt);
+            if (error != RECOMP_D3D_PRESENTER_OK) return error;
+            target_color = rt->texture;
+        }
+
+        SDL_GPUTexture *target_depth = lookupDepthTarget(presenter, draw.target);
+        float target_w = static_cast<float>(color_w);
+        float target_h = static_cast<float>(color_h);
+
+        if (draw.has_texture && !draw.texture_is_backbuffer) {
+            const RenderTargetEntry *sampled = findRenderTarget(presenter, draw.texture);
+            if (sampled && sampled->texture == target_color) {
+                std::fprintf(stderr, "recomp d3d presenter: cannot sample active render target data=0x%08X\n",
+                    draw.texture.data);
+                return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+            }
+        }
+
+        // A target switch or a frame-buffer read flushes the active segment.
+        if (presenter->segment.target_color != target_color ||
+            presenter->segment.target_depth != target_depth ||
+            (draw.has_texture && draw.texture_is_backbuffer)) {
+            flushSegment(presenter);
+        }
+
+        presenter->segment.target_color = target_color;
+        presenter->segment.target_depth = target_depth;
+        presenter->segment.target_w = target_w;
+        presenter->segment.target_h = target_h;
+
+        /* Modern water reads the scene drawn before it: the queued draws and
+           their depth pass are recorded first, and the color is copied once
+           per frame. */
+        const bool water = !presenter->simple_water && draw.water.enabled && !layout.pretransformed && !draw.program_count;
+        const bool water_scene = water && presenter->water_depth_live &&
+            target_color == presenter->backbuffer_color && target_depth == presenter->backbuffer_depth;
+        if (water) presenter->water_present = presenter->present_count;
+        if (water_scene && (presenter->segment.water_depth_pending ||
+                presenter->water_copy_present != presenter->present_count)) {
+            flushSegment(presenter);
+        }
+        if (water_scene && presenter->water_copy_present != presenter->present_count) {
+            presenter->water_copy_present = presenter->present_count;
+            ensureBackbufferResolved(presenter);
+            if (SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(getCommandBuffer(presenter))) {
+                const SDL_GPUTextureLocation from{presenter->backbuffer_resolve, 0, 0, 0, 0};
+                const SDL_GPUTextureLocation to{presenter->water_color, 0, 0, 0, 0};
+                SDL_CopyGPUTextureToTexture(copy, &from, &to, mainWidth(presenter), mainHeight(presenter), 1, false);
+                SDL_EndGPUCopyPass(copy);
+            }
+        }
+
+        // Prepare textures
+        SDL_GPUTexture *texture = draw.has_texture ? prepareTexture(presenter, draw) : nullptr;
+        SDL_GPUTexture *mask_texture = nullptr;
+
+        if (draw.has_alpha_mask) {
+            RecompD3dPresenterDrawCommand mask_cmd{};
+            mask_cmd.has_texture = true;
+            mask_cmd.texture = draw.alpha_mask;
+            mask_cmd.texture_bytes = draw.alpha_mask_bytes;
+            mask_cmd.texture_byte_count = draw.alpha_mask_byte_count;
+            mask_cmd.palette_bytes = draw.alpha_mask_palette;
+            mask_cmd.palette_byte_count = draw.alpha_mask_palette_byte_count;
+            mask_texture = prepareTexture(presenter, mask_cmd);
+        } else if (draw.has_reflection || draw.program_alpha_mask) {
+            RecompD3dPresenterDrawCommand refl_cmd{};
+            refl_cmd.has_texture = true;
+            refl_cmd.texture = draw.reflection_texture;
+            refl_cmd.texture_bytes = draw.reflection_bytes;
+            refl_cmd.texture_byte_count = draw.reflection_byte_count;
+            mask_texture = prepareTexture(presenter, refl_cmd);
+        } else if (draw.stage1_alpha) {
+            RecompD3dPresenterDrawCommand mask_cmd{};
+            mask_cmd.has_texture = true;
+            mask_cmd.texture = draw.alpha_mask;
+            mask_cmd.texture_bytes = draw.alpha_mask_bytes;
+            mask_cmd.texture_byte_count = draw.alpha_mask_byte_count;
+            mask_texture = prepareTexture(presenter, mask_cmd);
+        }
+
+        // Append vertex data
+        auto &vdata = presenter->segment.vertex_data;
+        uint32_t v_offset = static_cast<uint32_t>(vdata.size());
+        if (v_offset % 16u != 0u) {
+            vdata.resize((v_offset + 15u) & ~15u, 0);
+            v_offset = static_cast<uint32_t>(vdata.size());
+        }
+        const uint32_t v_size = draw.vertex_stride * draw.vertex_count;
+        const auto *v_src = static_cast<const uint8_t *>(draw.vertex_bytes);
+        vdata.insert(vdata.end(), v_src, v_src + v_size);
+
+        // Append index data
+        auto &idata = presenter->segment.index_data;
+        uint32_t i_offset = static_cast<uint32_t>(idata.size());
+        if (i_offset % 16u != 0u) {
+            idata.resize((i_offset + 15u) & ~15u, 0);
+            i_offset = static_cast<uint32_t>(idata.size());
+        }
+
+        uint32_t queued_index_count = draw.index_count;
+        if (draw.primitive_type == RECOMP_D3D_PT_TRIANGLEFAN) {
+            const auto *src_idx = static_cast<const uint16_t *>(draw.index_bytes);
+            queued_index_count = draw.triangle_count * 3u;
+            for (uint32_t t = 0u; t < draw.triangle_count; ++t) {
+                uint16_t fan[3] = {src_idx[0], src_idx[t + 1u], src_idx[t + 2u]};
+                const auto *b = reinterpret_cast<const uint8_t *>(fan);
+                idata.insert(idata.end(), b, b + sizeof(fan));
+            }
+        } else {
+            const uint32_t i_size = draw.index_count * sizeof(uint16_t);
+            const auto *i_src = static_cast<const uint8_t *>(draw.index_bytes);
+            idata.insert(idata.end(), i_src, i_src + i_size);
+        }
+        const uint32_t i_size = queued_index_count * sizeof(uint16_t);
+
+        const bool is_main = (target_color == presenter->backbuffer_color);
+        const bool use_msaa = is_main && (presenter->msaa_samples != SDL_GPU_SAMPLECOUNT_1);
+        const SDL_GPUSampleCount pass_samples = use_msaa ? presenter->msaa_samples : SDL_GPU_SAMPLECOUNT_1;
+        const SDL_GPUTextureFormat color_fmt = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+        const bool use_depth = (target_depth != nullptr);
+        const SDL_GPUTextureFormat depth_fmt = use_depth ? presenter->depth_format : SDL_GPU_TEXTUREFORMAT_INVALID;
+
+        // As in the D3D11 presenter, a draw whose shader or pipeline failed is declined.
+        SDL_GPUGraphicsPipeline *pipeline = getOrCreatePipeline(presenter, draw, layout, color_fmt, depth_fmt, pass_samples);
+        if (!pipeline) {
+            vdata.resize(v_offset);
+            idata.resize(i_offset);
+            return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+        }
+        SDL_GPUGraphicsPipeline *water_depth_pipeline = nullptr;
+        /* As in the D3D11 copy, the depth stops at the frame's first water
+           draw, so later creek tiles do not see the water as their bed. */
+        if (presenter->water_depth_live && draw.depth.depth_write_enable &&
+            presenter->water_copy_present != presenter->present_count &&
+            target_color == presenter->backbuffer_color && target_depth == presenter->backbuffer_depth) {
+            RecompD3dPresenterDrawCommand depth_only = draw;
+            depth_only.depth.stencil_enable = false;
+            depth_only.blend.blend_enable = false;
+            water_depth_pipeline = getOrCreatePipeline(presenter, depth_only, layout,
+                SDL_GPU_TEXTUREFORMAT_INVALID, SDL_GPU_TEXTUREFORMAT_D32_FLOAT, SDL_GPU_SAMPLECOUNT_1);
+        }
+
+        SDL_GPUSampler *s0 = (draw.four_tap_filter || draw.has_alpha_mask ||
+                (draw.program_count && (!draw.address_u || !draw.address_v)))
+            ? presenter->filter_sampler
+            : lookupDrawSampler(presenter, draw.address_u, draw.address_v);
+        // Like D3D11, the reflection environment map uses the draw's own sampler. GLSL binds
+        // one sampler per texture, so slot 1 carries it.
+        SDL_GPUSampler *s1 = (draw.program_alpha_mask || draw.stage1_alpha) ? presenter->program_mask_sampler
+            : (draw.has_reflection && !draw.has_alpha_mask) ? s0 : presenter->filter_sampler;
+
+        float constants[kTransformUniformFloats]{};
+
+        // Setup draw constants matching D3D11 layout
+        std::memcpy(constants, draw.transform, sizeof(draw.transform));
+        std::memcpy(constants + 16, draw.blend_transforms, sizeof(draw.blend_transforms));
+
+        if (layout.pretransformed || draw.program_count) {
+            std::memset(constants, 0, sizeof(draw.transform));
+            const float guest_w = draw.target.offscreen ? target_w : static_cast<float>(presenter->config.width);
+            const float guest_h = draw.target.offscreen ? target_h : static_cast<float>(presenter->config.height);
+            constants[0] = 2.0f / guest_w;
+            constants[5] = -2.0f / guest_h;
+            constants[10] = 1.0f;
+            // NV2A pixel centers are half integers, as the host's are.
+            constants[12] = -1.0f;
+            constants[13] = 1.0f;
+            constants[14] = 0.0f;
+            constants[15] = 1.0f;
+            if (presenter->widescreen && !draw.program_count && !draw.target.offscreen) {
+                float left = INFINITY, right = -INFINITY, top = INFINITY, bottom = -INFINITY;
+                for (uint32_t i = 0u; i < draw.vertex_count; ++i) {
+                    float xy[2];
+                    std::memcpy(xy, static_cast<const uint8_t *>(draw.vertex_bytes) +
+                        i * draw.vertex_stride, sizeof xy);
+                    if (!std::isfinite(xy[0]) || !std::isfinite(xy[1])) continue;
+                    left = std::min(left, xy[0]);
+                    right = std::max(right, xy[0]);
+                    top = std::min(top, xy[1]);
+                    bottom = std::max(bottom, xy[1]);
+                }
+                const auto scale = widescreen2dScale(presenter, left, right, top, bottom);
+                constants[12] += constants[0] * 0.5f * (1.0f - scale.x) * presenter->config.width;
+                constants[0] *= scale.x;
+                constants[13] += constants[5] * 0.5f * (1.0f - scale.y) * presenter->config.height;
+                constants[5] *= scale.y;
+            }
+            float snap_scale[2], snap_offset[2];
+            if (!draw.program_count && draw.primitive_type >= 5u &&
+                recomp_d3d_quad_native_edges(draw.vertex_bytes, draw.vertex_stride,
+                    draw.vertex_count, snap_scale, snap_offset)) {
+                for (unsigned axis = 0; axis < 2; ++axis) {
+                    constants[12 + axis] += constants[axis * 5] * snap_offset[axis];
+                    constants[axis * 5] *= snap_scale[axis];
+                }
+            }
+        }
+        /* The portrait sits in a 2D frame that widescreen narrows to 4:3, so its
+           viewport narrows the same way about the screen center. The game already
+           narrowed its projection for the stretched screen; undo that, or the
+           portrait is squeezed twice. */
+        const bool sub_viewport = draw.has_transform && !draw.program_count && draw.viewport[2] > 0.0f;
+        float squeeze = 1.0f;
+        if (sub_viewport && presenter->widescreen && !draw.target.offscreen) {
+            squeeze = widescreen2dScale(presenter, draw.viewport[0], draw.viewport[0] + draw.viewport[2],
+                draw.viewport[1], draw.viewport[1] + draw.viewport[3]).x;
+            for (unsigned row = 0; row < 16; ++row) constants[row * 4] /= squeeze;
+        }
+
+        if (draw.program_count) {
+            for (unsigned axis = 0; axis < 2; ++axis) {
+                const float scale = draw.program_constants[58][axis];
+                if (std::isfinite(scale) && scale != 0.0f) {
+                    constants[axis * 5] = 1.0f / scale;
+                    constants[12 + axis] = -draw.program_constants[59][axis] / scale;
+                }
+            }
+            const float depth_scale = draw.program_constants[58][2];
+            if (std::isfinite(depth_scale) && depth_scale > 0.0f) {
+                constants[10] = 1.0f / depth_scale;
+                constants[14] = -draw.program_constants[59][2] / depth_scale;
+            }
+            constants[138] = draw.program_alpha_mask ? 1.0f : 0.0f;
+            constants[139] = draw.program_mask_lod_bias;
+        }
+
+        if (draw.directional.enabled && !draw.program_count) {
+            const auto &light = draw.directional;
+            float *dir_constants = constants + kLightingUniformFloats;
+            std::memcpy(dir_constants, light.normal_transforms, sizeof(light.normal_transforms));
+            std::memcpy(dir_constants + 64, light.ambient_emissive, sizeof(light.ambient_emissive));
+            std::memcpy(dir_constants + 68, light.material_diffuse, sizeof(light.material_diffuse));
+            std::memcpy(dir_constants + 72, light.directions, sizeof(light.directions));
+            std::memcpy(dir_constants + 104, light.colors, sizeof(light.colors));
+            std::memcpy(dir_constants + 136, light.world_transforms, sizeof(light.world_transforms));
+            std::memcpy(dir_constants + 200, light.positions, sizeof(light.positions));
+            std::memcpy(dir_constants + 232, light.attenuation, sizeof(light.attenuation));
+            std::memcpy(dir_constants + 264, light.ambient, sizeof(light.ambient));
+            std::memcpy(dir_constants + 296, light.specular, sizeof(light.specular));
+            std::memcpy(dir_constants + 328, light.view, sizeof(light.view));
+            constants[140] = 1.0f;
+            constants[141] = light.normalize ? 1.0f : 0.0f;
+            constants[142] = static_cast<float>(light.count);
+            constants[143] = light.stage_mode ? 1.0f : 0.0f;
+            std::memcpy(constants + 144, light.stage, sizeof(light.stage));
+        }
+        if (draw.fog.mode != 0u && !draw.program_count) {
+            float *fog = constants + kHeaderUniformFloats - 12u;  // fog_params, fog_color
+            fog[0] = static_cast<float>(draw.fog.mode);
+            fog[1] = draw.fog.mode == 1u ? draw.fog.end : draw.fog.density;
+            fog[2] = draw.fog.mode == 1u ? 1.0f / (draw.fog.end - draw.fog.start) : 0.0f;
+            std::memcpy(fog + 4, draw.fog.color, sizeof draw.fog.color);
+        }
+        recomp_d3d_quad_texcoord_clamp(draw.vertex_bytes, draw.vertex_stride,
+            layout.pretransformed ? draw.vertex_count : 0u, layout.texcoord_offset,
+            constants + kHeaderUniformFloats - 4u);
+
+        constants[64] = (texture != nullptr) ? 1.0f : 0.0f;
+        constants[65] = draw.depth.alpha_test_enable ? 1.0f : 0.0f;
+        constants[66] = static_cast<float>(draw.depth.alpha_func);
+        constants[67] = static_cast<float>(draw.depth.alpha_ref);
+        constants[68] = (draw.blend_weight_count != 0u) ? 1.0f : 0.0f;
+        constants[69] = draw.use_texture_factor ? 1.0f : (draw.modulate_texture_factor ? 2.0f : 0.0f);
+        constants[70] = (draw.material_alpha_mode == RECOMP_D3D_MATERIAL_ALPHA_NONE) ? 1.0f : draw.material_alpha;
+        constants[71] = (draw.material_alpha_mode == RECOMP_D3D_MATERIAL_ALPHA_SELECT_DIFFUSE) ? 1.0f : 0.0f;
+
+        constants[72] = ((draw.texture_factor >> 16u) & 0xffu) / 255.0f;
+        constants[73] = ((draw.texture_factor >> 8u) & 0xffu) / 255.0f;
+        constants[74] = (draw.texture_factor & 0xffu) / 255.0f;
+        constants[75] = ((draw.texture_factor >> 24u) & 0xffu) / 255.0f;
+
+        constants[76] = draw.zero_diffuse_rgb ? 1.0f : 0.0f;
+        constants[77] = (draw.texture.format_byte == RECOMP_D3D_TEXTURE_FORMAT_A8) ? 1.0f : 0.0f;
+        constants[78] = (draw.alpha_mask.linear && draw.alpha_mask.width) ? 1.0f / draw.alpha_mask.width : 1.0f;
+        constants[79] = (draw.alpha_mask.linear && draw.alpha_mask.height) ? 1.0f / draw.alpha_mask.height : 1.0f;
+        constants[80] = (draw.texture.linear && draw.texture.width) ? 1.0f / draw.texture.width : 1.0f;
+        constants[81] = (draw.texture.linear && draw.texture.height) ? 1.0f / draw.texture.height : 1.0f;
+        constants[82] = draw.four_tap_filter ? 1.0f : 0.0f;
+        constants[83] = draw.has_alpha_mask ? 1.0f : 0.0f;
+
+        if (draw.has_reflection || draw.reflection_texgen) {
+            std::memcpy(constants + 84, draw.reflection_world_view, 64u);
+            std::memcpy(constants + 100, draw.reflection_normal, 64u);
+            std::memcpy(constants + 116, draw.reflection_transform, 64u);
+            std::memcpy(constants + 132, draw.reflection_diffuse, 16u);
+            constants[136] = draw.reflection_texgen ? 3.0f : draw.reflection_mesh_uv ? 2.0f : 1.0f;
+            constants[137] = draw.reflection_normalize ? 1.0f : 0.0f;
+            constants[138] = draw.stage1_alpha ? 2.0f : 0.0f;
+            constants[139] = 0.0f;
+        }
+        bool water_traced = false;
+        if (water) {
+            float *block = constants + kHeaderUniformFloats - 12u - 88u;  // water_world ... water_sun_color
+            water_traced = recomp_d3d_water_constants(&draw, block) && water_scene;
+            block[78] = 1.0f / mainWidth(presenter);
+            block[79] = 1.0f / mainHeight(presenter);
+            block[80] = water_traced ? 1.0f : 0.0f;
+        }
+
+        // Only lit draws push the directional block; vertex programs push
+        // their constants to the second vertex uniform slot.
+        const uint32_t vs_uniform_size = (draw.directional.enabled && !draw.program_count)
+            ? kTransformUniformFloats : kHeaderUniformFloats;
+        const uint32_t fs_uniform_size = kHeaderUniformFloats;
+
+        auto &udata = presenter->segment.uniform_data;
+        uint32_t uniform_offset = 0;
+        bool reused_uniforms = false;
+        if (!presenter->segment.draws.empty()) {
+            const auto &prev = presenter->segment.draws.back();
+            if (prev.vs_uniform_size == vs_uniform_size &&
+                prev.fs_uniform_size == fs_uniform_size &&
+                prev.uniform_offset + vs_uniform_size <= udata.size() &&
+                std::memcmp(constants, &udata[prev.uniform_offset], vs_uniform_size * sizeof(float)) == 0) {
+                uniform_offset = prev.uniform_offset;
+                reused_uniforms = true;
+            }
+        }
+
+        if (!reused_uniforms) {
+            uniform_offset = static_cast<uint32_t>(udata.size());
+            udata.insert(udata.end(), constants, constants + vs_uniform_size);
+        }
+        uint32_t program_offset = kNoProgramConstants;
+        if (draw.program_count) {
+            program_offset = static_cast<uint32_t>(udata.size());
+            const float *program_constants = &draw.program_constants[0][0];
+            udata.insert(udata.end(), program_constants, program_constants + kProgramConstantFloats);
+        }
+
+        QueuedDraw q{};
+        q.pipeline = pipeline;
+        q.vertex_offset = v_offset;
+        q.vertex_size = v_size;
+        q.index_offset = i_offset;
+        q.index_size = i_size;
+        q.index_count = queued_index_count;
+        q.base_vertex = -static_cast<int32_t>(draw.first_vertex);
+        q.texture = texture;
+        q.mask_texture = mask_texture;
+        q.sampler0 = s0;
+        q.sampler1 = s1;
+        q.constant_color = draw.blend.constant_color;
+        {
+            /* shortcut: mixing constant color and constant alpha in one draw is
+               unsupported, as in the D3D11 presenter. */
+            const auto alpha_factor = [](RecompD3dBlendFactor factor) {
+                return factor == RECOMP_D3D_BLEND_CONSTANT_ALPHA ||
+                    factor == RECOMP_D3D_BLEND_INV_CONSTANT_ALPHA;
+            };
+            q.constant_alpha = alpha_factor(draw.blend.src_factor) || alpha_factor(draw.blend.dst_factor);
+        }
+        /* D3D8 maps clip space onto the viewport and clips there, so a sub-rect
+           viewport (the select-screen portrait) must not reach the full target. */
+        if (sub_viewport) {
+            const float guest_w = draw.target.color.width ? static_cast<float>(draw.target.color.width)
+                : static_cast<float>(presenter->config.width);
+            const float guest_h = draw.target.color.height ? static_cast<float>(draw.target.color.height)
+                : static_cast<float>(presenter->config.height);
+            const float scale_x = draw.target.offscreen ? 1.0f : target_w / guest_w;
+            const float scale_y = draw.target.offscreen ? 1.0f : target_h / guest_h;
+            q.viewport = {draw.viewport[0] * scale_x, draw.viewport[1] * scale_y,
+                draw.viewport[2] * scale_x, draw.viewport[3] * scale_y,
+                draw.viewport[4], draw.viewport[5]};
+            const float width = static_cast<float>(presenter->config.width);
+            q.viewport.x = (squeeze * draw.viewport[0] + 0.5f * (1.0f - squeeze) * width) * scale_x;
+            q.viewport.w *= squeeze;
+        }
+        q.stencil_ref = static_cast<uint8_t>(draw.depth.stencil_ref);
+        q.uniform_offset = uniform_offset;
+        q.vs_uniform_size = vs_uniform_size;
+        q.program_offset = program_offset;
+        q.fs_uniform_size = fs_uniform_size;
+        q.water_scene = water_traced;
+        q.water_depth_pipeline = water_depth_pipeline;
+        if (water_depth_pipeline) presenter->segment.water_depth_pending = true;
+
+        presenter->segment.draws.push_back(q);
+        ++presenter->draw_count;
+        return RECOMP_D3D_PRESENTER_OK;
+    }
+
+    case RECOMP_D3D_PRESENTER_COMMAND_SHAPE:
+        return submitShape(presenter, command->data.shape);
+    case RECOMP_D3D_PRESENTER_COMMAND_GAMMA: {
+        const auto &ramp = command->data.gamma;
+        bool enabled = false;
+        for (unsigned i = 0u; i < 256u; ++i) {
+            for (unsigned channel = 0u; channel < 3u; ++channel) {
+                presenter->gamma_ramp[i][channel] = ramp[channel][i] / 255.0f;
+                enabled |= ramp[channel][i] != i;
+            }
+        }
+        if (enabled && !ensureGammaPass(presenter)) return RECOMP_D3D_PRESENTER_HOST_FAILURE;
+        presenter->gamma_enabled = enabled;
+        return RECOMP_D3D_PRESENTER_OK;
+    }
+
+    default:
+        return RECOMP_D3D_PRESENTER_UNSUPPORTED_COMMAND;
+    }
+}
+
+RecompD3dPresenterError recomp_d3d_presenter_release_memory(
+    RecompD3dPresenter *presenter, uint32_t base, uint32_t size)
+{
+    if (presenter == nullptr || presenter != active_presenter) {
+        return RECOMP_D3D_PRESENTER_NOT_INITIALIZED;
+    }
+    if (std::this_thread::get_id() != presenter->owner_thread) {
+        return RECOMP_D3D_PRESENTER_WRONG_THREAD;
+    }
+    flushSegment(presenter);
+
+    if (base >= 0x80000000u && base < 0x84000000u) base -= 0x80000000u;
+    if (size == 0u || static_cast<uint64_t>(base) + size > UINT64_C(0x100000000)) {
+        return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    }
+
+    const auto released = [&](uint32_t data) {
+        if (data >= 0x80000000u && data < 0x84000000u) data -= 0x80000000u;
+        return static_cast<uint64_t>(data) >= static_cast<uint64_t>(base) &&
+               static_cast<uint64_t>(data) < static_cast<uint64_t>(base) + static_cast<uint64_t>(size);
+    };
+
+    // Freed targets return their bytes to the budget, as in the D3D11 presenter.
+    for (size_t i = 0u; i < presenter->render_targets.size();) {
+        RenderTargetEntry &entry = presenter->render_targets[i];
+        if (!released(entry.desc.data)) { ++i; continue; }
+        if (entry.texture) SDL_ReleaseGPUTexture(presenter->device, entry.texture);
+        presenter->target_bytes -= static_cast<uint64_t>(entry.width) * entry.height * 4u;
+        entry = presenter->render_targets.back();
+        presenter->render_targets.pop_back();
+    }
+    for (size_t i = 0u; i < presenter->depth_targets.size();) {
+        DepthTargetEntry &entry = presenter->depth_targets[i];
+        if (!released(entry.desc.data)) { ++i; continue; }
+        if (entry.texture) SDL_ReleaseGPUTexture(presenter->device, entry.texture);
+        presenter->target_bytes -= entry.bytes;
+        entry = presenter->depth_targets.back();
+        presenter->depth_targets.pop_back();
+    }
+
+    for (uint32_t i = 0u; i < presenter->texture_count; ++i) {
+        TextureEntry &entry = presenter->textures[i];
+        if (entry.used && released(entry.data)) {
+            unindexTexture(presenter, i);
+            if (entry.texture) SDL_ReleaseGPUTexture(presenter->device, entry.texture);
+            entry.used = false;
+        }
+    }
+    return RECOMP_D3D_PRESENTER_OK;
+}
+
+RecompD3dPresenterError recomp_d3d_presenter_destroy(
+    RecompD3dPresenter **presenter)
+{
+    if (presenter == nullptr) {
+        return RECOMP_D3D_PRESENTER_INVALID_ARGUMENT;
+    }
+    if (*presenter == nullptr || *presenter != active_presenter) {
+        return RECOMP_D3D_PRESENTER_NOT_INITIALIZED;
+    }
+    if (std::this_thread::get_id() != (*presenter)->owner_thread) {
+        return RECOMP_D3D_PRESENTER_WRONG_THREAD;
+    }
+
+    auto *p = *presenter;
+    p->precompile_stop = true;
+    if (p->precompile_thread.joinable()) {
+        p->precompile_thread.join();
+    }
+    flushSegment(p);
+
+    if (p->current_command_buffer) {
+        SDL_SubmitGPUCommandBuffer(p->current_command_buffer);
+        p->current_command_buffer = nullptr;
+    }
+
+    // Release cached textures
+    for (uint32_t i = 0u; i < p->texture_count; ++i) {
+        if (p->textures[i].used && p->textures[i].texture) {
+            SDL_ReleaseGPUTexture(p->device, p->textures[i].texture);
+        }
+    }
+    p->textures.clear();
+    p->texture_index.clear();
+
+    // Release render targets
+    for (auto &rt : p->render_targets) {
+        if (rt.texture) SDL_ReleaseGPUTexture(p->device, rt.texture);
+    }
+    p->render_targets.clear();
+
+    // Release depth targets
+    for (auto &dt : p->depth_targets) {
+        if (dt.texture) SDL_ReleaseGPUTexture(p->device, dt.texture);
+    }
+    p->depth_targets.clear();
+
+    // Release pipelines
+    for (auto &pair : p->pipelines) {
+        if (pair.second) SDL_ReleaseGPUGraphicsPipeline(p->device, pair.second);
+    }
+    p->pipelines.clear();
+    if (p->gamma_pipeline) SDL_ReleaseGPUGraphicsPipeline(p->device, p->gamma_pipeline);
+    if (p->gamma_target) SDL_ReleaseGPUTexture(p->device, p->gamma_target);
+
+    // Release compiled shaders
+    for (auto &pair : p->shader_cache) {
+        if (pair.second.vertex_shader) SDL_ReleaseGPUShader(p->device, pair.second.vertex_shader);
+        if (pair.second.fragment_shader) SDL_ReleaseGPUShader(p->device, pair.second.fragment_shader);
+    }
+    p->shader_cache.clear();
+
+    // Release dynamic ring buffers
+    if (p->draw_vertex_buffer) SDL_ReleaseGPUBuffer(p->device, p->draw_vertex_buffer);
+    if (p->draw_index_buffer) SDL_ReleaseGPUBuffer(p->device, p->draw_index_buffer);
+    if (p->draw_vertex_transfer) SDL_ReleaseGPUTransferBuffer(p->device, p->draw_vertex_transfer);
+    if (p->draw_index_transfer) SDL_ReleaseGPUTransferBuffer(p->device, p->draw_index_transfer);
+    p->draw_vertex_used = 0u;
+    p->draw_index_used = 0u;
+
+    // Release samplers
+    for (auto &row : p->address_samplers) {
+        for (auto &s : row) {
+            if (s) {
+                SDL_ReleaseGPUSampler(p->device, s);
+                s = nullptr;
+            }
+        }
+    }
+    recomp_overlay_sdl_gpu_shutdown();
+    if (p->filter_sampler) SDL_ReleaseGPUSampler(p->device, p->filter_sampler);
+    if (p->point_sampler) SDL_ReleaseGPUSampler(p->device, p->point_sampler);
+    if (p->program_mask_sampler) SDL_ReleaseGPUSampler(p->device, p->program_mask_sampler);
+    if (p->dummy_texture) SDL_ReleaseGPUTexture(p->device, p->dummy_texture);
+    if (p->water_color) SDL_ReleaseGPUTexture(p->device, p->water_color);
+    if (p->water_depth) SDL_ReleaseGPUTexture(p->device, p->water_depth);
+    if (p->backbuffer_color) SDL_ReleaseGPUTexture(p->device, p->backbuffer_color);
+    if (p->backbuffer_depth) SDL_ReleaseGPUTexture(p->device, p->backbuffer_depth);
+    if (p->backbuffer_resolve && p->backbuffer_resolve != p->backbuffer_color) SDL_ReleaseGPUTexture(p->device, p->backbuffer_resolve);
+    if (p->backbuffer_copy) SDL_ReleaseGPUTexture(p->device, p->backbuffer_copy);
+    if (p->frontbuffer_copy) SDL_ReleaseGPUTexture(p->device, p->frontbuffer_copy);
+    if (p->present_texture) SDL_ReleaseGPUTexture(p->device, p->present_texture);
+
+    if (p->window) {
+        SDL_ReleaseWindowFromGPUDevice(p->device, p->window);
+        SDL_DestroyWindow(p->window);
+    }
+    if (p->device) {
+        SDL_DestroyGPUDevice(p->device);
+    }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+
+    delete p;
+    active_presenter = nullptr;
+    *presenter = nullptr;
+    return RECOMP_D3D_PRESENTER_OK;
+}
+
+void recomp_d3d_presenter_set_immediate_present(bool enabled)
+{
+    immediate_present_setting = enabled;
+    if (active_presenter && active_presenter->window && active_presenter->device) {
+        const auto mode = preferMailbox(enabled) &&
+            SDL_WindowSupportsGPUPresentMode(
+                active_presenter->device, active_presenter->window, SDL_GPU_PRESENTMODE_MAILBOX)
+            ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC;
+        SDL_SetGPUSwapchainParameters(
+            active_presenter->device, active_presenter->window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode);
+    }
+}
+
+bool recomp_d3d_presenter_split_enabled(void)
+{
+    return false;
+}
+
+void recomp_d3d_presenter_report_draw_textures(void)
+{
+}
+
+} // extern "C"

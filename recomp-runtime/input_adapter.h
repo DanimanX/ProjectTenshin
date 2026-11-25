@@ -1,0 +1,39 @@
+#ifndef DOAXBV_RECOMP_INPUT_ADAPTER_H
+#define DOAXBV_RECOMP_INPUT_ADAPTER_H
+
+#include "input_model.h"
+#include "runtime.h"
+#include "synctest.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Returns false when no pad is present on the port. */
+typedef bool (*RecompInputSampleSource)(
+    uint32_t port,
+    RecompInputGamepad *gamepad);
+
+RecompFunction recomp_input_lookup_manual(uint32_t guest_address);
+void recomp_input_adapter_reset(void);
+void recomp_input_adapter_set_source(RecompInputSampleSource source);
+/* Called once per presented frame; the next poll of each port resamples.
+   Without a present, a port resamples after a frame of guest time. */
+void recomp_input_adapter_next_frame(void);
+
+typedef void (*RecompInputFeedbackSink)(
+    uint32_t port,
+    uint16_t left_motor,
+    uint16_t right_motor);
+void recomp_input_adapter_set_feedback_sink(RecompInputFeedbackSink sink);
+RecompInputSampleSource recomp_input_adapter_source(void);
+const RecompInputModel *recomp_input_adapter_model(void);
+/* Guest-visible pad state and the frame's sample latch. The host sample
+   source is not part of it. */
+extern const RecompSyncTestModule recomp_input_adapter_module;
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

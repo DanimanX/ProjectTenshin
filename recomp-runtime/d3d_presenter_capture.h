@@ -1,0 +1,99 @@
+#ifndef DOAXBV_RECOMP_D3D_PRESENTER_CAPTURE_H
+#define DOAXBV_RECOMP_D3D_PRESENTER_CAPTURE_H
+
+#include "d3d_presenter.h"
+
+#include <cstddef>
+#include <new>
+#include <utility>
+#include <vector>
+
+class D3dCapturePacket {
+public:
+    enum Kind : uint32_t { COMMAND, RELEASE, REPORT };
+    struct Record { Kind kind; uint32_t base; uint32_t size; };
+
+    D3dCapturePacket() = default;
+    D3dCapturePacket(const D3dCapturePacket &) = delete;
+    D3dCapturePacket &operator=(const D3dCapturePacket &) = delete;
+    // The move empties spans_, so the source's span count must reset with it.
+    D3dCapturePacket(D3dCapturePacket &&other) noexcept
+        : entries_(std::move(other.entries_)), commands_(std::move(other.commands_)),
+          payload_(std::move(other.payload_)), spans_(std::move(other.spans_)),
+          span_count_(std::exchange(other.span_count_, 0u)), sealed_(other.sealed_) {}
+    D3dCapturePacket &operator=(D3dCapturePacket &&other) noexcept
+    {
+        entries_ = std::move(other.entries_);
+        commands_ = std::move(other.commands_);
+        payload_ = std::move(other.payload_);
+        spans_ = std::move(other.spans_);
+        span_count_ = std::exchange(other.span_count_, 0u);
+        sealed_ = other.sealed_;
+        return *this;
+    }
+
+    RecompD3dPresenterError add(const RecompD3dPresenterCommand &command);
+    RecompD3dPresenterError addRelease(uint32_t base, uint32_t size);
+    RecompD3dPresenterError addReport();
+    void seal();
+    size_t count() const;
+    const Record &record(size_t index) const;
+    const RecompD3dPresenterCommand &command(size_t index) const;
+    void clear();
+    // Copied commands, records and aligned payload bytes, excluding capacity.
+    uint64_t bytes() const;
+
+    struct Size { size_t entries, commands, payload_words, spans; };
+    Size size() const;
+    // Growing a packet mid-frame copies megabytes on the game thread; reserve ahead instead.
+    void reserve(const Size &size);
+
+private:
+    // Default-initializes instead of zeroing; Debug builds rebind to proxy types.
+    template <typename T>
+    struct NoInitAllocator : std::allocator<T> {
+        using std::allocator<T>::allocator;
+        template <typename U>
+        struct rebind { using other = NoInitAllocator<U>; };
+
+        template <typename U>
+        void construct(U *pointer)
+        {
+            ::new (static_cast<void *>(pointer)) U;
+        }
+
+        template <typename U, typename... Args>
+        void construct(U *pointer, Args &&...args)
+        {
+            ::new (static_cast<void *>(pointer)) U(std::forward<Args>(args)...);
+        }
+    };
+
+    struct Entry { Record record; size_t command_index; };
+    struct CapturedCommand {
+        CapturedCommand() {} // Skip zeroing: add() writes every field it uses.
+        alignas(8) RecompD3dPresenterCommand value;
+        size_t offsets[7];
+    };
+    // offset == SIZE_MAX marks an empty slot.
+    struct Span { const void *source; size_t size; size_t offset; };
+
+    RecompD3dPresenterError addRecord(Kind kind, uint32_t base, uint32_t size);
+    // Grows the span table to hold span_count at most half full.
+    void reserveSpans(size_t span_count);
+    void insertSpan(const void *source, size_t size, size_t offset);
+    void clearSpans();
+
+    std::vector<Entry> entries_;
+    std::vector<CapturedCommand> commands_;
+    // Word storage keeps indices and vertex data aligned after relocation.
+    // resize() appends uninitialized words; add() overwrites the used bytes.
+    std::vector<uint64_t, NoInitAllocator<uint64_t>> payload_;
+    // Open-addressing table keyed by source address; memcmp still confirms each
+    // reuse. Slots persist across clear(), so a frame allocates nothing.
+    std::vector<Span> spans_;
+    size_t span_count_ = 0u;
+    bool sealed_ = false;
+};
+
+#endif

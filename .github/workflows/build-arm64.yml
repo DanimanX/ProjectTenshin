@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Automatically cross-compiles and verifies the ROM-free Linux ARM64 / Vulkan
+# runtime, Freedreno hardware probe, ARM64 runtime self-tests, and SDL3 launcher
+# for ProjectTenshin (Qualcomm Snapdragon + Mesa Freedreno/Turnip), runs the full
+# host CTest + Python test suites, and publishes GitHub Releases on tags.
+#
+# Zero copyrighted game files or ROM-derived game code ever enter the build or artifacts.
+name: Build ARM64 Vulkan
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_cpu:
+        description: 'Target Snapdragon ARM64 CPU (cortex_a77 for SD865/870, cortex_x3 for SD8 Gen 2, generic)'
+        required: false
+        default: 'cortex_a77'
+
+permissions:
+  contents: write
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install host build and Vulkan test dependencies
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update -q
+          sudo apt-get -o Acquire::Retries=3 install -qy --no-install-recommends \
+            build-essential cmake ninja-build python3 curl git tar xz-utils file binutils \
+            mesa-vulkan-drivers libvulkan1 libshaderc1
+
+      - name: Cache cross-compile dependencies (Zig, SDL3 headers, Dear ImGui)
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            extern
+            !deps/zig-cache
+          key: projecttenshin-deps-${{ hashFiles('tools/build-arm64.sh') }}
+
+      - name: Cross-compile AArch64 Snapdragon/Vulkan package
+        env:
+          TARGET_CPU: ${{ github.event.inputs.target_cpu || 'cortex_a77' }}
+        run: |
+          chmod +x tools/build-arm64.sh tools/build-arm64-game.sh tools/build-host-test.sh run_arm64_vulkan.sh
+          tools/build-arm64.sh
+          (cd dist && sha256sum ProjectTenshin-Linux-ARM64-Vulkan.tar.gz > ProjectTenshin-Linux-ARM64-Vulkan.tar.gz.sha256)
+          ls -lh dist/
+
+      - name: Run host runtime, Freedreno Vulkan, and tooling tests
+        run: |
+          tools/build-host-test.sh
+
+      - name: Upload Linux ARM64 Vulkan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectTenshin-Linux-ARM64-Vulkan
+          path: |
+            dist/ProjectTenshin-Linux-ARM64-Vulkan.tar.gz
+            dist/ProjectTenshin-Linux-ARM64-Vulkan.tar.gz.sha256
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          FILES="dist/ProjectTenshin-Linux-ARM64-Vulkan.tar.gz dist/ProjectTenshin-Linux-ARM64-Vulkan.tar.gz.sha256"
+          cat > dist/notes-tail.md <<'EOF'
+          Automated ROM-free Linux ARM64 / Vulkan build of **ProjectTenshin** (Dead or Alive 3++ static recompilation port based on `NoRain211/doa3-re`), targeting Qualcomm Snapdragon devices running Mesa Freedreno / Turnip Vulkan.
+
+          ### Contents (Zero Game Files / Zero Game Code)
+          - `run_arm64_vulkan.sh` (Freedreno/Turnip ICD auto-detection, persistent SPIR-V cache, Snapdragon tuning)
+          - `launcher.aarch64` (SDL3 ARM64 gamepad-friendly settings launcher, max `GLIBC_2.28`, statically linked `libc++`)
+          - `tenshin_vk_probe.aarch64` (Snapdragon CPU cluster + Freedreno/Turnip Vulkan format & MSAA hardware probe)
+          - `tenshin_runtime_test.aarch64` & `tenshin_freedreno_test.aarch64` (AArch64 fiber switching, portable math, and SPIR-V cache self-tests)
+          - `README-Snapdragon-Freedreno.md` and licences
+
+          ### Quick Setup (BYOD)
+          1. Build your local `doa3.aarch64` binary from your legal DOA3 Xbox disc using `tools/build-arm64-game.sh /path/to/doa3.iso`.
+          2. Place `doa3.aarch64` and your extracted `disc/` folder alongside `run_arm64_vulkan.sh`.
+          3. Run `./tenshin_vk_probe.aarch64` to verify Freedreno/Turnip Vulkan, then launch `./run_arm64_vulkan.sh`.
+          EOF
+          sed -i 's/^          //' dist/notes-tail.md
+          if [ -f "docs/release-notes/$TAG.md" ]; then
+            cat "docs/release-notes/$TAG.md" dist/notes-tail.md > dist/release-notes.md
+          else
+            cat dist/notes-tail.md > dist/release-notes.md
+          fi
+          TITLE="ProjectTenshin $TAG (Linux ARM64 Vulkan — Snapdragon/Freedreno)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+            gh release edit "$TAG" --draft=false --latest --title "$TITLE" \
+              --notes-file dist/release-notes.md
+          else
+            gh release create "$TAG" $FILES --title "$TITLE" \
+              --notes-file dist/release-notes.md --latest
+          fi

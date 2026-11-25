@@ -1,0 +1,999 @@
+#include "fiber_adapter.h"
+#include "cri_service_adapter.h"
+#include "d3d_frame_adapter.h"
+#include "doa3_build.h"
+#include "stop_report.h"
+#include "xbox_memory_layout.h"
+
+#include "native_fiber.h"
+
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+enum {
+    XAPI_MINIMUM_FIBER_STACK = 0x3000u,
+};
+
+/* XAPILIB 3911, verified against DOA3; see docs/doa3-fibers.md. The hooks are
+   USA keys; the TLS index is read directly, and Japan 3.1 keeps it at
+   0x0040A178 (SwitchToFiber 0x0018C9D3). */
+const RecompFiberBindings recomp_fiber_doa3_bindings = {
+    0x00164f50u, 0x00164fdcu, 0x00164fefu, 0x0016502eu,
+    DOA3(0x00b228c8u, 0x0040a178u, 0x0040abb8u),
+};
+const RecompFiberBindings recomp_fiber_doaxbv_bindings = {
+    0x00182fbbu, 0x00183047u, 0x0018305au, 0x00183099u, 0x003b5258u,
+};
+
+static uint32_t tls_index_address;
+
+typedef struct RecompHostFiber {
+    bool active;
+    uint32_t guest_handle;
+    uint32_t guest_stack_base;
+    uint32_t guest_stack_size;
+    uint32_t entry;
+    uint64_t switch_count;
+    LPVOID native_fiber;
+} RecompHostFiber;
+
+static RecompFiberModel fiber_model;
+static RecompHostFiber host_fibers[RECOMP_FIBER_MAX_COUNT];
+static RecompHostFiber *current_host_fiber;
+static bool converted_thread;
+
+uint32_t recomp_fiber_thread_context(void)
+{
+    return fiber_model.current_handle;
+}
+
+void recomp_fiber_thread_restore(uint32_t handle)
+{
+    fiber_model.current_handle = handle;
+    converted_thread = handle != 0u;
+    current_host_fiber = NULL;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        if (host_fibers[i].active && host_fibers[i].guest_handle == handle) {
+            current_host_fiber = &host_fibers[i];
+            break;
+        }
+    }
+}
+
+static uint32_t main_fiber_handle(void)
+{
+    uint32_t tls_index = *recomp_memory_u32(tls_index_address);
+    uint32_t tls_slots = *recomp_memory_u32(4u);
+    uint32_t tls_block = *recomp_memory_u32(tls_slots + tls_index * 4u);
+
+    return tls_block + 8u;
+}
+
+static void publish_current_fiber(uint32_t guest_handle)
+{
+    uint32_t tls_index = *recomp_memory_u32(tls_index_address);
+    uint32_t tls_slots = *recomp_memory_u32(4u);
+    uint32_t tls_block = *recomp_memory_u32(tls_slots + tls_index * 4u);
+
+    *recomp_memory_u32(tls_block + 4u) = guest_handle;
+}
+
+static uint32_t stack_argument(uint32_t entry_esp, uint32_t index)
+{
+    return *recomp_memory_u32(entry_esp + 4u + index * 4u);
+}
+
+static void finish(uint32_t entry_esp, uint32_t argument_count, uint32_t result)
+{
+    recomp_runtime.registers.eax = result;
+    recomp_runtime.registers.esp =
+        entry_esp + 4u + argument_count * 4u;
+}
+
+static void fail_fiber(const char *reason, uint32_t guest_handle)
+{
+    fprintf(
+        stderr,
+        "recomp fiber: %s 0x%08" PRIx32 "\n",
+        reason,
+        guest_handle);
+    recomp_stop(2, "fiber:%s:0x%08" PRIx32, reason, guest_handle);
+}
+
+static RecompHostFiber *host_fiber_find(uint32_t guest_handle)
+{
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        if (host_fibers[i].active &&
+            host_fibers[i].guest_handle == guest_handle) {
+            return &host_fibers[i];
+        }
+    }
+    return NULL;
+}
+
+/* A deleted fiber stays parked so a snapshot that still contains it can
+   rewind the delete; its native context is still suspended at the switch.
+   The native fiber outlives handle reuse, so snapshots find slots by it. */
+static RecompHostFiber *host_fiber_find_native(void *native_fiber)
+{
+    if (native_fiber == NULL) return NULL;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        if (host_fibers[i].native_fiber == native_fiber) return &host_fibers[i];
+    }
+    return NULL;
+}
+
+static RecompHostFiber *host_fiber_add(
+    uint32_t guest_handle,
+    LPVOID native_fiber)
+{
+    if (native_fiber == NULL || host_fiber_find(guest_handle) != NULL) {
+        return NULL;
+    }
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        if (!host_fibers[i].active) {
+            host_fibers[i] = (RecompHostFiber){
+                .active = true,
+                .guest_handle = guest_handle,
+                .native_fiber = native_fiber,
+            };
+            return &host_fibers[i];
+        }
+    }
+    return NULL;
+}
+
+static VOID WINAPI fiber_entry(void *parameter)
+{
+    RecompHostFiber *host = parameter;
+    RecompFiber *fiber = recomp_fiber_find(&fiber_model, host->guest_handle);
+    uint32_t entry;
+
+    if (fiber == NULL || current_host_fiber != host ||
+        fiber_model.current_handle != host->guest_handle) {
+        fail_fiber("entry-context", host->guest_handle);
+    }
+    entry = fiber->entry;
+    recomp_runtime.registers = fiber->registers;
+    *recomp_memory_u32(0u) = fiber->exception_list;
+    recomp_dispatch_indirect_site(
+        entry, fiber->registers.esp, __FILE__, __LINE__);
+    fail_fiber("entry-returned", host->guest_handle);
+}
+
+void recomp_fiber_adapter_reset(void)
+{
+    void *running = recomp_native_fiber_current();
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        RecompHostFiber *host = &host_fibers[i];
+        /* Parked fibers, deleted ones included, own their stacks; a converted
+           thread's fiber belongs to its guest thread. */
+        if (host->native_fiber != NULL && host->native_fiber != running &&
+            host->guest_stack_base != 0u) {
+            recomp_native_fiber_delete(host->native_fiber);
+        }
+    }
+    if (converted_thread && current_host_fiber != NULL &&
+        current_host_fiber->guest_handle == main_fiber_handle()) {
+        recomp_native_fiber_release_thread();
+    }
+    recomp_fiber_model_reset(&fiber_model);
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        host_fibers[i] = (RecompHostFiber){0};
+    }
+    current_host_fiber = NULL;
+    converted_thread = false;
+}
+
+const RecompFiberModel *recomp_fiber_adapter_model(void)
+{
+    return &fiber_model;
+}
+
+typedef struct FiberHostState {
+    uint32_t guest_handle;
+    /* Slot bookkeeping decides whether a create allocates a guest stack or
+       reuses one, so a rewind has to put it back. */
+    uint32_t guest_stack_base;
+    uint32_t guest_stack_size;
+    uint32_t entry;
+    /* Restore finds the slot by native fiber, which outlives handle reuse. */
+    RecompParkedFiber parked;
+} FiberHostState;
+
+typedef struct FiberAdapterState {
+    RecompFiberModel model;
+    uint32_t current_host_handle;
+    bool converted_thread;
+    FiberHostState hosts[RECOMP_FIBER_MAX_COUNT];
+} FiberAdapterState;
+
+static void fiber_state_save(void *state)
+{
+    FiberAdapterState *out = state;
+    RecompHostFiber *running = current_host_fiber;
+    /* Each slot's 64 KB stack copy is written only up to its used bytes. */
+    memset(out, 0, offsetof(FiberAdapterState, hosts));
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i)
+        memset(&out->hosts[i], 0, offsetof(FiberHostState, parked.native.stack));
+    out->model = fiber_model;
+    out->current_host_handle = running != NULL ? running->guest_handle : 0u;
+    out->converted_thread = converted_thread;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        RecompHostFiber *host = &host_fibers[i];
+        if (host->guest_handle == 0u || host->native_fiber == NULL) continue;
+        out->hosts[i].guest_handle = host->guest_handle;
+        out->hosts[i].guest_stack_base = host->guest_stack_base;
+        out->hosts[i].guest_stack_size = host->guest_stack_size;
+        out->hosts[i].entry = host->entry;
+        out->hosts[i].parked.fiber = host->native_fiber;
+        /* The running fiber's host stack is the caller's own live stack, and
+           a snapshot only restores while that same fiber runs, so it is
+           never rewound or compared. */
+        if (host == running) continue;
+        recomp_native_fiber_state_save(host->native_fiber, &out->hosts[i].parked.native);
+    }
+}
+
+/* The live host fiber the snapshot says was running. */
+static RecompHostFiber *saved_current_host(const FiberAdapterState *in)
+{
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT && in->current_host_handle != 0u; ++i) {
+        if (in->hosts[i].guest_handle == in->current_host_handle)
+            return host_fiber_find_native(in->hosts[i].parked.fiber);
+    }
+    return NULL;
+}
+
+/* False when another fiber is running than the one saved, or a saved fiber's
+   host slot was reused or its stack did not fit. A deleted fiber stays
+   parked; the running one saved no stack. */
+static bool fiber_state_restorable(const void *state, size_t size)
+{
+    const FiberAdapterState *in = state;
+    (void)size;
+    if (saved_current_host(in) != current_host_fiber) return false;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        const RecompParkedFiber *saved = &in->hosts[i].parked;
+        void *fiber;
+        if (in->hosts[i].guest_handle == 0u) continue;
+        fiber = host_fiber_find_native(saved->fiber) != NULL ? saved->fiber : NULL;
+        if (!recomp_parked_fiber_restorable(saved, fiber, "fiber", i)) return false;
+    }
+    return true;
+}
+
+/* Compares the guest-visible fiber model and slot bookkeeping. Host stack
+   bytes hold dead locals and are not part of the simulation. */
+static bool fiber_state_equal(const void *left, const void *right, size_t size)
+{
+    const FiberAdapterState *a = left, *b = right;
+    (void)size;
+    if (memcmp(&a->model, &b->model, sizeof a->model) != 0) return false;
+    if (a->current_host_handle != b->current_host_handle) return false;
+    if (a->converted_thread != b->converted_thread) return false;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        if (a->hosts[i].guest_handle != b->hosts[i].guest_handle) return false;
+        if (a->hosts[i].guest_stack_base != b->hosts[i].guest_stack_base ||
+            a->hosts[i].guest_stack_size != b->hosts[i].guest_stack_size) {
+            fprintf(stderr, "recomp synctest: fiber %zu handle=0x%08" PRIx32
+                " stack 0x%08" PRIx32 "+0x%x/0x%08" PRIx32 "+0x%x\n", i,
+                a->hosts[i].guest_handle,
+                a->hosts[i].guest_stack_base, a->hosts[i].guest_stack_size,
+                b->hosts[i].guest_stack_base, b->hosts[i].guest_stack_size);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void fiber_state_restore(const void *state)
+{
+    const FiberAdapterState *in = state;
+    RecompHostFiber *running = current_host_fiber;
+    RecompHostFiber *target = saved_current_host(in);
+    if (target != running)
+        fail_fiber("restore-not-running", in->current_host_handle);
+    fiber_model = in->model;
+    current_host_fiber = target;
+    converted_thread = in->converted_thread;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        const FiberHostState *saved = &in->hosts[i];
+        RecompHostFiber *host;
+        if (saved->guest_handle == 0u) continue;
+        host = host_fiber_find_native(saved->parked.fiber);
+        if (host == NULL) fail_fiber("restore-missing-host", saved->guest_handle);
+        host->guest_handle = saved->guest_handle;
+        host->guest_stack_base = saved->guest_stack_base;
+        host->guest_stack_size = saved->guest_stack_size;
+        host->entry = saved->entry;
+        /* The caller's own stack is live; only parked fibers are rewritten. */
+        if (host == running) continue;
+        /* A converted thread keeps the runner's own stack, which is live. */
+        if (!recomp_native_fiber_owns_stack(host->native_fiber)) continue;
+        if (!recomp_native_fiber_state_restore(host->native_fiber, &saved->parked.native))
+            fail_fiber("restore-context", saved->guest_handle);
+    }
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        RecompHostFiber *host = &host_fibers[i];
+        if (in->hosts[i].guest_handle == 0u) {
+            /* Slots the snapshot did not have are free again; the native
+               stack stays for a later create to restart. */
+            host->guest_handle = 0u;
+            host->guest_stack_base = 0u;
+            host->guest_stack_size = 0u;
+            host->active = false;
+        }
+        if (host->guest_handle == 0u) continue;
+        host->active = recomp_fiber_find(&fiber_model, host->guest_handle) != NULL;
+        if (host->active && host->native_fiber == NULL)
+            fail_fiber("restore-missing-host", host->guest_handle);
+    }
+}
+
+const RecompSyncTestModule recomp_fiber_adapter_module = {"fibers", sizeof(FiberAdapterState),
+    fiber_state_save, fiber_state_restore, fiber_state_equal, fiber_state_restorable,
+    .reset = recomp_fiber_adapter_reset};
+
+size_t recomp_fiber_adapter_stack_ranges(RecompRamRange *ranges, size_t capacity)
+{
+    size_t count = 0u;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT && count < capacity; ++i) {
+        const RecompHostFiber *host = &host_fibers[i];
+        if (!host->active || host->guest_stack_base == 0u) continue;
+        ranges[count++] = (RecompRamRange){host->guest_stack_base,
+            (size_t)host->guest_stack_base + host->guest_stack_size};
+    }
+    return count;
+}
+
+void recomp_fiber_adapter_report(void)
+{
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        const RecompHostFiber *host = &host_fibers[i];
+
+        if (!host->active) {
+            continue;
+        }
+        fprintf(
+            stderr,
+            "recomp fiber: handle=0x%08" PRIx32 " entry=0x%08" PRIx32
+            " resumed=%llu%s\n",
+            host->guest_handle,
+            host->entry,
+            (unsigned long long)host->switch_count,
+            host == current_host_fiber ? " (current)" : "");
+    }
+}
+
+static void convert_thread_to_fiber_adapter(void)
+{
+    uint32_t entry_esp = recomp_runtime.registers.esp;
+    uint32_t fiber_data = stack_argument(entry_esp, 0u);
+    uint32_t guest_handle = main_fiber_handle();
+    RecompRegisters registers = recomp_runtime.registers;
+    LPVOID native_fiber;
+    RecompFiber *fiber;
+    RecompHostFiber *host;
+
+    if (converted_thread || current_host_fiber != NULL) {
+        fail_fiber("duplicate-convert", guest_handle);
+    }
+    native_fiber = recomp_native_fiber_current();
+    if (native_fiber == NULL) {
+        fail_fiber("convert-failed", guest_handle);
+    }
+    fiber = recomp_fiber_add(
+        &fiber_model,
+        guest_handle,
+        0u,
+        fiber_data,
+        &registers,
+        *recomp_memory_u32(0u));
+    host = host_fiber_add(guest_handle, native_fiber);
+    if (fiber == NULL || host == NULL ||
+        !recomp_fiber_set_current(&fiber_model, guest_handle)) {
+        fail_fiber("convert-state", guest_handle);
+    }
+
+    *recomp_memory_u32(guest_handle) = fiber_data;
+    *recomp_memory_u32(guest_handle + 4u) = entry_esp + 8u;
+    *recomp_memory_u32(guest_handle + 8u) = 0u;
+    *recomp_memory_u32(guest_handle + 12u) = entry_esp;
+    publish_current_fiber(guest_handle);
+    converted_thread = true;
+    current_host_fiber = host;
+    finish(entry_esp, 1u, guest_handle);
+}
+
+static void create_fiber_adapter(void)
+{
+    uint32_t entry_esp = recomp_runtime.registers.esp;
+    uint32_t stack_size = stack_argument(entry_esp, 0u);
+    uint32_t entry = stack_argument(entry_esp, 1u);
+    uint32_t parameter = stack_argument(entry_esp, 2u);
+    uint32_t stack_base;
+    uint32_t stack_top;
+    uint32_t guest_handle;
+    uint32_t initial_esp;
+    RecompRegisters registers = {0};
+    RecompFiber *fiber;
+    RecompHostFiber *host;
+    LPVOID native_fiber;
+
+    if (!converted_thread || entry == 0u) {
+        fail_fiber("create-context", entry);
+    }
+    if (stack_size < XAPI_MINIMUM_FIBER_STACK) {
+        stack_size = XAPI_MINIMUM_FIBER_STACK;
+    }
+    stack_size = (stack_size + 0xfffu) & 0xfffff000u;
+    host = NULL;
+    for (size_t i = 0u; i < RECOMP_FIBER_MAX_COUNT; ++i) {
+        if (!host_fibers[i].active) {
+            host = &host_fibers[i];
+            break;
+        }
+    }
+    if (host == NULL) {
+        fail_fiber("create-host-capacity", entry);
+    }
+    if (host->guest_stack_size >= stack_size) {
+        stack_base = host->guest_stack_base;
+        stack_size = host->guest_stack_size;
+    } else {
+        stack_base = xbox_HeapAlloc(stack_size, 0x1000u);
+    }
+    if (stack_base == 0u || stack_base > UINT32_MAX - stack_size) {
+        fail_fiber("guest-stack", entry);
+    }
+    recomp_guest_memset(stack_base, 0, stack_size);
+    stack_top = stack_base + stack_size;
+    guest_handle = stack_top - 0x10u;
+    initial_esp = guest_handle - 8u;
+    registers.esp = initial_esp;
+
+    *recomp_memory_u32(initial_esp) = 0u;
+    *recomp_memory_u32(initial_esp + 4u) = parameter;
+    *recomp_memory_u32(guest_handle) = parameter;
+    *recomp_memory_u32(guest_handle + 4u) = stack_top;
+    *recomp_memory_u32(guest_handle + 8u) = stack_base;
+    *recomp_memory_u32(guest_handle + 12u) = initial_esp;
+
+    fiber = recomp_fiber_add(
+        &fiber_model,
+        guest_handle,
+        entry,
+        parameter,
+        &registers,
+        0xffffffffu);
+    if (fiber == NULL) {
+        fail_fiber("create-state", guest_handle);
+    }
+    /* A reused slot keeps its native stack so a snapshot that still names
+       this fiber can rewind it. */
+    native_fiber = host->native_fiber;
+    if (native_fiber != NULL) recomp_native_fiber_restart(native_fiber, fiber_entry, host);
+    else native_fiber = recomp_native_fiber_create(fiber_entry, host);
+    if (native_fiber == NULL) {
+        fail_fiber("create-host", guest_handle);
+    }
+    *host = (RecompHostFiber){
+        .active = true,
+        .guest_handle = guest_handle,
+        .guest_stack_base = stack_base,
+        .guest_stack_size = stack_size,
+        .entry = entry,
+        .native_fiber = native_fiber,
+    };
+    fprintf(
+        stderr,
+        "recomp fiber: created handle=0x%08" PRIx32 " entry=0x%08" PRIx32
+        " parameter=0x%08" PRIx32 "\n",
+        guest_handle,
+        entry,
+        parameter);
+    finish(entry_esp, 3u, guest_handle);
+}
+
+/* DOA3's legal-notice scroll loop at 0x00022330 in 0x00021F70 runs ESI from 0
+   through 30 * [0x002FD55C] frames, yielding each frame via 0x0009E562 ->
+   0x0009E552 -> SwitchToFiber, and never checks controller input. When that
+   yield resumes after a button press, advance ESI past the loop limit so
+   0x00022337 sets the fade alpha to 0, exits to 0x000223BB, and tears the
+   scroll task down through 0x000572C0(0). */
+bool recomp_doa3_skip_legal_notice(uint32_t entry_esp)
+{
+    uint32_t total_frames;
+
+    if (entry_esp > UINT32_MAX - 32u ||
+        *recomp_memory_u32(entry_esp) != 0x0009e560u ||
+        *recomp_memory_u32(entry_esp + 12u) != 0x0009e595u ||
+        *recomp_memory_u32(entry_esp + 28u) != 0x00022337u) {
+        return false;
+    }
+    if (*recomp_memory(0x004b8438u, 1u) != 1u ||
+        (*recomp_memory_u32(0x005e5f90u) |
+         (*recomp_memory_u32(0x005e5f88u) & 0x3ff0u)) == 0u) {
+        return false;
+    }
+    total_frames = (uint32_t)*recomp_memory(0x002fd55cu, 1u) * 0x1eu;
+    if (recomp_runtime.registers.esi > total_frames) {
+        return false;
+    }
+    fprintf(
+        stderr,
+        "recomp boot: legal notice skipped at frame %" PRIu32 "\n",
+        recomp_runtime.registers.esi);
+    recomp_runtime.registers.esi = total_frames + 1u;
+    return true;
+}
+
+/* DOA3's select-screen loader task (USA 0x000CD070, Japan 0x000D33B0) yields
+   once per check of its four 32-byte request slots, so a cursor move waits up
+   to four frames before its portrait load starts, twice per switch. When the
+   task resumes idle (no load in flight) on an empty slot, point its slot
+   cursor at the next pending slot so this frame's check takes it. */
+bool recomp_doa3_select_next_request(uint32_t entry_esp)
+{
+    enum {
+        RESUME = DOA3(0x000cd087u, 0x000d33c7u, 0x000d3487u),
+        SLOTS = DOA3(0x00860ff0u, 0x009b7910u, 0x00972970u),
+    };
+    /* USA keeps the in-flight flag in EBP, which the yield pushed just below
+       its return address; Japan keeps it in EDI. */
+    uint32_t *cursor = DOA3(&recomp_runtime.registers.edi, &recomp_runtime.registers.esi, &recomp_runtime.registers.esi);
+    uint32_t busy = DOA3(*recomp_memory_u32(entry_esp + 24u), recomp_runtime.registers.edi, recomp_runtime.registers.edi);
+
+    if (entry_esp > UINT32_MAX - 32u ||
+        *recomp_memory_u32(entry_esp + 28u) != RESUME || busy != 0u ||
+        *recomp_memory(SLOTS + (*cursor & 3u) * 32u, 1u) != 0u) {
+        return false;
+    }
+    for (uint32_t step = 1u; step < 4u; ++step) {
+        uint32_t slot = (*cursor + step) & 3u;
+        if (*recomp_memory(SLOTS + slot * 32u, 1u) != 0u) {
+            *cursor = slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* DOA3's file wait (USA 0x0007E860, Japan 0x00085D70) polls ADXF_GetStat and
+   yields a frame per poll, including the poll that finds the file done and
+   closes it (BL = 0), after which it returns. ADXF_GetStat now finishes a
+   file within one poll, so that trailing yield is the only per-file delay;
+   returning from it at once lets the loader open the next file this frame. */
+bool recomp_doa3_skip_done_file_wait(uint32_t entry_esp)
+{
+    return entry_esp <= UINT32_MAX - 32u &&
+        *recomp_memory_u32(entry_esp + 28u) == DOA3(0x0007e8adu, 0x00085dbdu, 0x00085eadu) &&
+        (recomp_runtime.registers.ebx & 0xffu) == 0u;
+}
+
+static RecompFiberSwitchHook switch_hook;
+
+void recomp_fiber_set_switch_hook(RecompFiberSwitchHook hook)
+{
+    switch_hook = hook;
+}
+
+static void switch_to_fiber_adapter(void)
+{
+    uint32_t entry_esp = recomp_runtime.registers.esp;
+    uint32_t result = recomp_runtime.registers.eax;
+    if (tls_index_address == recomp_fiber_doa3_bindings.tls_index &&
+        recomp_doa3_skip_done_file_wait(entry_esp)) {
+        recomp_runtime.registers.esp = entry_esp + 8u;
+        return;
+    }
+    uint32_t target_handle = stack_argument(entry_esp, 0u);
+    RecompFiber *outgoing = recomp_fiber_current(&fiber_model);
+    RecompFiber *target = recomp_fiber_find(&fiber_model, target_handle);
+    RecompHostFiber *outgoing_host = current_host_fiber;
+    RecompHostFiber *target_host = host_fiber_find(target_handle);
+
+    if (outgoing == NULL || target == NULL || outgoing_host == NULL ||
+        target_host == NULL) {
+        fail_fiber("unknown-switch", target_handle);
+    }
+    if (switch_hook != NULL && switch_hook(outgoing->guest_handle, target_handle)) {
+        finish(entry_esp, 1u, result);
+        return;
+    }
+#ifdef RECOMP_DOAXBV_BINDINGS
+    /* Round 119 probe. Screen 7 (the island map) reaches a cooperative wait in
+       guest sub_000DEC50 at loc_000DED70 that yields here every iteration and
+       never exits: measured 99% of one core on this fiber with every other
+       thread idle. Three conditions could keep it there, and they are
+       distinguished entirely by state readable at this seam:
+         1. the yield is a self-switch, so no other fiber can ever run;
+         2. no entry in the 256-entry table at 0x5DDE84 matches the waited key;
+         3. an entry matches but its completion word at +8 stays zero.
+       Opt-in via RECOMP_SPINPROBE so the default run is unchanged. */
+    {
+        static const char *spin_probe;
+        static bool spin_probe_read;
+        static uint32_t spin_lines;
+        static uint32_t spin_switches;
+        static uint32_t spin_self;
+
+        if (!spin_probe_read) {
+            spin_probe_read = true;
+            spin_probe = getenv("RECOMP_SPINPROBE");
+        }
+        if (spin_probe != NULL) {
+            ++spin_switches;
+            if (target_handle == outgoing->guest_handle) {
+                ++spin_self;
+            }
+            /* Report sparsely: the spin issues these continuously, so a line
+               per switch would bury the log. */
+            if (spin_lines < 400u && (spin_switches % 20000u) == 0u) {
+                uint32_t record_root = *recomp_memory_u32(0x00317764u);
+                uint32_t record = *recomp_memory_u32(record_root);
+                uint32_t want_handle = *recomp_memory_u32(record + 0x134u);
+                uint32_t sel_index = *recomp_memory_u16(0x0031E4FCu);
+                uint32_t sel_table = *recomp_memory_u32(0x0031E504u);
+                uint32_t want_key =
+                    *recomp_memory_u32(sel_table + sel_index * 4u) & 0xFFFFu;
+                uint32_t match_slot = 0xFFFFFFFFu;
+                uint32_t match_done = 0u;
+                uint32_t key_only_slot = 0xFFFFFFFFu;
+                uint32_t nonzero_done = 0u;
+                uint32_t free_slots = 0u;
+                uint32_t zero_handle_slots = 0u;
+                uint32_t i;
+                /* sub_000A2E99..sub_000A2ECE count the ADXF channels whose
+                   handle word (0x005DEC58 + ch*0x14 + 0x10) is non-NULL and
+                   refuse to start any new request once that count reaches the
+                   limit byte at 0x005DD882. One channel left open forever
+                   therefore starves every later load. Report all five. */
+                uint32_t chan_open = 0u;
+                uint32_t staged_slots = 0u;
+                uint32_t chan[5];
+
+                for (i = 0u; i < 5u; ++i) {
+                    chan[i] = *recomp_memory_u32(0x005DEC68u + i * 0x14u);
+                    if (chan[i] != 0u) {
+                        ++chan_open;
+                    }
+                }
+                /* Queue slots live at 0x005DD884 + n*0xC with the state byte
+                   at +1; 0xFE means staged and waiting for a channel. */
+                for (i = 0u; i < 0x80u; ++i) {
+                    if ((*recomp_memory_i8(0x005DD885u + i * 0xCu) & 0xFF) ==
+                        0xFE) {
+                        ++staged_slots;
+                    }
+                }
+
+                for (i = 0u; i < 0x100u; ++i) {
+                    uint32_t entry = 0x005DDE84u + i * 0xCu;
+                    uint32_t key = *recomp_memory_u16(entry);
+                    uint32_t handle = *recomp_memory_u32(entry + 4u);
+                    uint32_t done = *recomp_memory_u32(entry + 8u);
+
+                    if (done != 0u) {
+                        ++nonzero_done;
+                    }
+                    /* sub_000A3140 publishes into the first slot whose handle
+                       word is 0xFFFFFFFF and silently drops the request when
+                       none is free, so occupancy separates "never posted"
+                       from "posted but the table was full". */
+                    if (handle == 0xFFFFFFFFu) {
+                        ++free_slots;
+                    }
+                    if (handle == 0u) {
+                        ++zero_handle_slots;
+                    }
+                    if (key != want_key) {
+                        continue;
+                    }
+                    if (key_only_slot == 0xFFFFFFFFu) {
+                        key_only_slot = i;
+                    }
+                    if (handle == want_handle && match_slot == 0xFFFFFFFFu) {
+                        match_slot = i;
+                        match_done = done;
+                    }
+                }
+                ++spin_lines;
+                fprintf(
+                    stderr,
+                    "recomp spinprobe: switches=%" PRIu32
+                    " self=%" PRIu32 " from=%08" PRIx32
+                    " to=%08" PRIx32 " want_key=%04" PRIx32
+                    " want_handle=%08" PRIx32 " match_slot=%" PRId32
+                    " match_done=%08" PRIx32 " key_slot=%" PRId32
+                    " table_done_count=%" PRIu32 "\n",
+                    spin_switches,
+                    spin_self,
+                    outgoing->guest_handle,
+                    target_handle,
+                    want_key,
+                    want_handle,
+                    (int32_t)match_slot,
+                    match_done,
+                    (int32_t)key_only_slot,
+                    nonzero_done);
+                /* The request the spin waits on is posted into the mailbox at
+                   0x005DDE78 and drained by sub_000A2E00 into the 128-entry
+                   queue at 0x005DD885, which only publishes a table entry once
+                   sub_000A32F0 polls the owning ADXF channel. Report the
+                   mailbox and queue head next to the table result so a request
+                   that was never posted is distinguishable from one posted but
+                   never drained. */
+                fprintf(
+                    stderr,
+                    "recomp spinq: switches=%" PRIu32
+                    " staged=%02" PRIx32 " op=%02" PRIx32
+                    " mbkey=%04" PRIx32 " mbarg=%08" PRIx32
+                    " head=%02" PRIx32 " limit=%02" PRIx32
+                    " active=%02" PRIx32 " ch0=%08" PRIx32
+                    " ch1=%08" PRIx32 " stat=%" PRIu32
+                    " wsteps=%" PRIu32 " free=%" PRIu32
+                    " zerohnd=%" PRIu32 " chanopen=%" PRIu32
+                    " staged_q=%" PRIu32 " ch=%08" PRIx32
+                    ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32
+                    ",%08" PRIx32 "\n",
+                    spin_switches,
+                    (uint32_t)(*recomp_memory_i8(0x005DDE79u) & 0xFF),
+                    (uint32_t)(*recomp_memory_i8(0x005DDE78u) & 0xFF),
+                    (uint32_t)*recomp_memory_u16(0x005DDE7Au),
+                    *recomp_memory_u32(0x005DDE7Cu),
+                    (uint32_t)(*recomp_memory_i8(0x005DD885u) & 0xFF),
+                    (uint32_t)(*recomp_memory_i8(0x005DD882u) & 0xFF),
+                    (uint32_t)(*recomp_memory_i8(0x005DD880u) & 0xFF),
+                    *recomp_memory_u32(0x005DEC68u),
+                    *recomp_memory_u32(0x005DEC7Cu),
+                    recomp_cri_service_adxf_get_stat_calls(),
+                    recomp_cri_service_file_worker_steps(),
+                    free_slots,
+                    zero_handle_slots,
+                    chan_open,
+                    staged_slots,
+                    chan[0], chan[1], chan[2], chan[3], chan[4]);
+            }
+        }
+    }
+    /* Round 121 bridge. At screen 7 the guest waits in sub_000DEC50's scan at
+       loc_000DED70 for a table entry matching (selector key, record handle).
+       The request that would produce that entry is posted once, above the
+       loop, and loc_000DED3C skips the post outright when the staging slot is
+       busy at that instant; the loop below has no re-post path. Round 120
+       measured the aftermath at the stall: nothing staged, no ADXF channel
+       open, 223 of 256 table slots free and no slot carrying the waited key,
+       so the scan can never be satisfied and the swap counter stops. Post the
+       same request the guest would have posted, into queue entry 0 (where the
+       insertion sort in sub_000A3060 would have placed it), and let the
+       guest's own loader run it. No completion is fabricated: if the file is
+       absent the entry still publishes with size zero and the wait stays put.
+       Opt-in via RECOMP_REPOST so the default run is unchanged. */
+    {
+        static const char *repost_env;
+        static bool repost_read;
+        static uint32_t repost_count;
+        static uint32_t switches_since_repost;
+
+        if (!repost_read) {
+            repost_read = true;
+            repost_env = getenv("RECOMP_REPOST");
+        }
+        if (repost_env != NULL && repost_count < 8u) {
+            static uint32_t last_swap;
+            static uint32_t switches_at_swap;
+            uint32_t swap_now = recomp_d3d_frame_adapter_swap_counter();
+
+            ++switches_since_repost;
+            /* Round 121 measured the first version of this gate firing during
+               ordinary loading at swap 6408, where a request really was in
+               flight, and that corrupted the walk. The stall is not "the wait
+               loop is hot" -- that loop is hot during every normal load. The
+               stall is the wait loop running while the swap counter has
+               stopped advancing entirely. Require that: at least 50,000 fiber
+               switches with no new frame presented. */
+            if (swap_now != last_swap) {
+                last_swap = swap_now;
+                switches_at_swap = switches_since_repost;
+            }
+            if (switches_since_repost - switches_at_swap >= 50000u) {
+                uint32_t record_root = *recomp_memory_u32(0x00317764u);
+                uint32_t record = *recomp_memory_u32(record_root);
+                uint32_t want_handle = *recomp_memory_u32(record + 0x134u);
+                uint32_t sel_index = *recomp_memory_u16(0x0031E4FCu);
+                uint32_t sel_table = *recomp_memory_u32(0x0031E504u);
+                uint32_t want_key =
+                    *recomp_memory_u32(sel_table + sel_index * 4u) & 0xFFFFu;
+                bool matched = false;
+                uint32_t i;
+
+                switches_at_swap = switches_since_repost;
+                for (i = 0u; i < 0x100u; ++i) {
+                    uint32_t entry = 0x005DDE84u + i * 0xCu;
+
+                    if ((uint32_t)*recomp_memory_u16(entry) == want_key &&
+                        *recomp_memory_u32(entry + 4u) == want_handle) {
+                        matched = true;
+                        break;
+                    }
+                }
+                /* Act only on the exact measured shape: a live wait with the
+                   whole pipeline idle. Any other state has a request in
+                   flight and must be left alone. */
+                if (!matched && want_key != 0u && want_key != 0xFFFFu &&
+                    (*recomp_memory_i8(0x005DDE79u) & 0xFF) != 0xFE &&
+                    (*recomp_memory_i8(0x005DD885u) & 0xFF) == 0xFF) {
+                    *recomp_memory_i8(0x005DD884u) = (int8_t)5;
+                    *recomp_memory_u16(0x005DD886u) = (uint16_t)want_key;
+                    *recomp_memory_u32(0x005DD888u) = want_handle;
+                    *recomp_memory_i8(0x005DD885u) = (int8_t)0xFE;
+                    ++repost_count;
+                    fprintf(
+                        stderr,
+                        "recomp repost: n=%" PRIu32 " key=%04" PRIx32
+                        " handle=%08" PRIx32 "\n",
+                        repost_count,
+                        want_key,
+                        want_handle);
+                }
+            }
+        }
+    }
+#endif
+    /* Opt-in RECOMP_FIBER_WAIT: when a fiber yields from a new place, print
+       the code addresses on its guest stack (likely callers) to locate a
+       task that waits forever. */
+    {
+        static const char *wait_trace;
+        static bool wait_trace_read;
+        static uint32_t wait_lines;
+        static struct { uint32_t handle, sites[8]; } last[64];
+
+        if (!wait_trace_read) {
+            wait_trace_read = true;
+            wait_trace = getenv("RECOMP_FIBER_WAIT");
+        }
+        if (wait_trace != NULL && wait_lines < 4000u) {
+            uint32_t sites[8] = {0};
+            unsigned count = 0u, slot = 0u;
+
+            for (uint32_t i = 0u; i < 96u && count < 8u; ++i) {
+                uint32_t word = *recomp_memory_u32(entry_esp + i * 4u);
+                if (word >= 0x00011000u && word < 0x00200000u) sites[count++] = word;
+            }
+            while (slot < 63u && last[slot].handle != 0u &&
+                   last[slot].handle != outgoing->guest_handle) {
+                ++slot;
+            }
+            if (memcmp(last[slot].sites, sites, sizeof sites) != 0) {
+                last[slot].handle = outgoing->guest_handle;
+                memcpy(last[slot].sites, sites, sizeof sites);
+                ++wait_lines;
+                fprintf(stderr, "recomp fiber wait: fiber=0x%08" PRIx32
+                    " swap=%" PRIu32 " sites=%x %x %x %x %x %x %x %x\n",
+                    outgoing->guest_handle, recomp_d3d_frame_adapter_swap_counter(),
+                    sites[0], sites[1], sites[2], sites[3],
+                    sites[4], sites[5], sites[6], sites[7]);
+            }
+        }
+    }
+    if (target_handle == outgoing->guest_handle) {
+        finish(entry_esp, 1u, result);
+        return;
+    }
+
+    outgoing->registers = recomp_runtime.registers;
+    outgoing->registers.esp = entry_esp + 8u;
+    /* Hardware preserves the x87 and SSE context per thread. Measured at 240
+       of 240 switches, this program's stack is non-empty at the boundary, so
+       without this the incoming fiber inherits the outgoing one's floating
+       point and silently computes with it. */
+    recomp_fpu_context_save(&outgoing->fpu);
+    /* Round 28 probe. RecompFiber carries only RecompRegisters, while the
+       x87 stack, fpu_top and the XMM file live outside it in RecompRuntime
+       and are therefore shared by every fiber. Real hardware gives each
+       thread its own FP context. If fpu_top is ever non-zero here, live
+       floating-point values are crossing a fiber boundary. Opt-in. */
+    {
+        static const char *fpu_trace;
+        static bool fpu_trace_read;
+        static uint32_t fpu_trace_lines;
+        static uint32_t switches_seen;
+        static uint32_t switches_with_stack;
+
+        if (!fpu_trace_read) {
+            fpu_trace_read = true;
+            fpu_trace = getenv("RECOMP_FIBER_FPU");
+        }
+        if (fpu_trace != NULL) {
+            ++switches_seen;
+            if (recomp_runtime.fpu_top != 0u) {
+                ++switches_with_stack;
+            }
+            if (fpu_trace_lines < 240u &&
+                (recomp_runtime.fpu_top != 0u ||
+                 (switches_seen % 500u) == 0u)) {
+                ++fpu_trace_lines;
+                fprintf(
+                    stderr,
+                    "recomp fiber fpu: switches=%" PRIu32
+                    " nonempty=%" PRIu32 " top=%" PRIu32
+                    " cmp=%d from=%08" PRIx32 " to=%08" PRIx32 "\n",
+                    switches_seen,
+                    switches_with_stack,
+                    recomp_runtime.fpu_top,
+                    recomp_runtime.fpu_compare,
+                    outgoing->guest_handle,
+                    target_handle);
+            }
+        }
+    }
+    ++target_host->switch_count;
+    outgoing->exception_list = *recomp_memory_u32(0u);
+    *recomp_memory_u32(outgoing->guest_handle + 12u) =
+        outgoing->registers.esp;
+    if (!recomp_fiber_set_current(&fiber_model, target_handle)) {
+        fail_fiber("switch-state", target_handle);
+    }
+    recomp_runtime.registers = target->registers;
+    recomp_fpu_context_restore(&target->fpu);
+    *recomp_memory_u32(0u) = target->exception_list;
+    publish_current_fiber(target_handle);
+    current_host_fiber = target_host;
+    recomp_native_fiber_switch(target_host->native_fiber);
+
+    if (current_host_fiber != outgoing_host ||
+        fiber_model.current_handle != outgoing->guest_handle) {
+        fail_fiber("resume-context", outgoing->guest_handle);
+    }
+    recomp_runtime.registers.eax = result;
+    if (tls_index_address == recomp_fiber_doa3_bindings.tls_index) {
+        (void)recomp_doa3_skip_legal_notice(entry_esp);
+        (void)recomp_doa3_select_next_request(entry_esp);
+    }
+}
+
+static void delete_fiber_adapter(void)
+{
+    uint32_t entry_esp = recomp_runtime.registers.esp;
+    uint32_t guest_handle = stack_argument(entry_esp, 0u);
+    RecompFiber *fiber = recomp_fiber_find(&fiber_model, guest_handle);
+    RecompHostFiber *host = host_fiber_find(guest_handle);
+
+    if (fiber == NULL || host == NULL || host == current_host_fiber) {
+        fail_fiber("invalid-delete", guest_handle);
+    }
+    /* Keep the native context parked for a snapshot rewind, and the guest
+       stack for the next create in this slot: the guest allocator is
+       monotonic, so reuse keeps a delete/create cycle off the heap. */
+    host->active = false;
+    if (!recomp_fiber_remove(&fiber_model, guest_handle)) {
+        fail_fiber("delete-state", guest_handle);
+    }
+    finish(entry_esp, 1u, 0u);
+}
+
+RecompFunction recomp_fiber_lookup_manual(
+    uint32_t guest_address, const RecompFiberBindings *bindings)
+{
+    RecompFunction function;
+
+    if (guest_address == bindings->create) {
+        function = create_fiber_adapter;
+    } else if (guest_address == bindings->delete_fiber) {
+        function = delete_fiber_adapter;
+    } else if (guest_address == bindings->switch_to) {
+        function = switch_to_fiber_adapter;
+    } else if (guest_address == bindings->convert_thread) {
+        function = convert_thread_to_fiber_adapter;
+    } else {
+        return NULL;
+    }
+    tls_index_address = bindings->tls_index;
+    return function;
+}
