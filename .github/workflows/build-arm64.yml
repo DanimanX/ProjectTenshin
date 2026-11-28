@@ -96,7 +96,7 @@ jobs:
           else
             cat dist/notes-tail.md > dist/release-notes.md
           fi
-          TITLE="ProjectTenshin $TAG (Linux ARM64 Vulkan — Snapdragon/Freedreno)"
+          TITLE="ProjectTenshin $TAG (Linux x86_64 + ARM64, Vulkan)"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" $FILES --clobber
             gh release edit "$TAG" --draft=false --latest --title "$TITLE" \

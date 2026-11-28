@@ -5,7 +5,7 @@
 Linux **x86_64** is now a full target beside ARM64/Snapdragon, verified on an
 MSI Claw A1M (Intel Core Ultra 5 135H, Intel Arc iGPU, CachyOS, Steam Game Mode
 over gamescope). See
-[docs/release-notes/v1.1.0-linux-x86_64.md](docs/release-notes/v1.1.0-linux-x86_64.md)
+[docs/release-notes/v1.1.0.md](docs/release-notes/v1.1.0.md)
 for what was measured and on which machine, and
 [docs/x86_64-linux.md](docs/x86_64-linux.md) for the build and run guide.
 

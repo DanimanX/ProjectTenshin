@@ -30,22 +30,26 @@ jobs:
       - name: Install host build and Vulkan test dependencies
         run: |
           sudo apt-get -o Acquire::Retries=3 update -q
+          # What the build and the test suite cannot run without.
           sudo apt-get -o Acquire::Retries=3 install -qy --no-install-recommends \
             build-essential cmake ninja-build pkg-config python3 python3-venv \
-            libsdl3-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libxfixes-dev libsdl3-tests libxkbcommon-dev libwayland-dev \
-            wayland-protocols libdecor-0-dev libdrm-dev libgbm-dev libegl-dev libgl-dev \
-            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libusb-1.0-0-dev \
-            libshaderc-dev libshaderc1 mesa-vulkan-drivers libvulkan1 \
-            libarchive-tools curl git file binutils
-        continue-on-error: true
+            git curl file binutils libarchive-tools \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev \
+            libdrm-dev libgbm-dev libegl-dev libgl-dev \
+            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libusb-1.0-0-dev
+          # Ubuntu 24.04 has no SDL3 package and no libshaderc1 name; both are
+          # best-effort here because the build falls back to the pinned SDL3
+          # release and the Vulkan tests skip when shaderc is absent.
+          sudo apt-get -o Acquire::Retries=3 install -qy --no-install-recommends \
+            libsdl3-dev mesa-vulkan-drivers libvulkan1 libshaderc-dev || true
 
-      - name: Install SDL3 when the distribution has no package for it
+      - name: Report the SDL3 the build will use
         run: |
           if pkg-config --exists sdl3; then
             echo "system SDL3: $(pkg-config --modversion sdl3)"
           else
-            echo "The distribution has no SDL3; CMake will build the pinned release."
+            echo "The distribution has no SDL3; CMake builds the pinned 3.4.12 release."
           fi
 
       - name: Python tooling tests
@@ -57,8 +61,12 @@ jobs:
       - name: Build the x86_64 runtime, self-tests and probe, then run CTest
         run: |
           chmod +x tools/build-linux-x86_64.sh tools/build-host-test.sh run_linux_vulkan.sh
+          CMAKE_EXTRA=("-DRECOMP_NETPLAY_VERSION=ci-${GITHUB_SHA::8}")
+          if ! pkg-config --exists sdl3; then
+            CMAKE_EXTRA+=("-DRECOMP_FETCH_SDL3=ON" "-DSDL_UNIX_CONSOLE_BUILD=ON")
+          fi
           cmake -S recomp-runtime -B build/recomp-runtime -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DRECOMP_NETPLAY_VERSION="ci-${GITHUB_SHA::8}"
+            -DCMAKE_BUILD_TYPE=Release "${CMAKE_EXTRA[@]}"
           cmake --build build/recomp-runtime --parallel "$(nproc)"
           SDL_VIDEO_DRIVER=offscreen ctest --test-dir build/recomp-runtime --output-on-failure
 
