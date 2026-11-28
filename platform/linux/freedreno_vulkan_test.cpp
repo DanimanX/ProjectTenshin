@@ -12,47 +12,47 @@
 #include <vector>
 
 static void test_cpulist_parsing() {
-    auto a = projecttenshin::arm64::parse_cpulist("0-7\n");
+    auto a = projecttenshin::host::parse_cpulist("0-7\n");
     assert(a.size() == 8 && a.front() == 0 && a.back() == 7);
 
-    auto b = projecttenshin::arm64::parse_cpulist("0,3,5-7");
+    auto b = projecttenshin::host::parse_cpulist("0,3,5-7");
     assert(b.size() == 5);
     assert(b[0] == 0 && b[1] == 3 && b[2] == 5 && b[3] == 6 && b[4] == 7);
 
-    auto c = projecttenshin::arm64::parse_cpulist("");
+    auto c = projecttenshin::host::parse_cpulist("");
     assert(c.empty());
 }
 
 static void test_snapdragon_cluster_classification() {
     // Snapdragon 865 (Retroid Pocket 5): 4x A55 @ 1.8GHz, 3x A77 @ 2.42GHz, 1x A77 @ 2.84GHz
-    std::vector<projecttenshin::arm64::CpuCoreInfo> sd865 = {
+    std::vector<projecttenshin::host::CpuCoreInfo> sd865 = {
         {0, 1804800, true}, {1, 1804800, true}, {2, 1804800, true}, {3, 1804800, true},
         {4, 2419200, true}, {5, 2419200, true}, {6, 2419200, true},
         {7, 2841600, true},
     };
-    auto t865 = projecttenshin::arm64::classify_topology(sd865);
+    auto t865 = projecttenshin::host::classify_topology(sd865);
     assert(t865.heterogeneous);
     assert(t865.prime_cores.size() == 1 && t865.prime_cores[0] == 7);
     assert(t865.gold_cores.size() == 4); // cores 4, 5, 6, 7
     assert(t865.silver_cores.size() == 4); // cores 0, 1, 2, 3
 
     // Snapdragon 8 Gen 2 (AYN Odin 2): 3x A510 @ 2.02GHz, 4x Gold @ 2.8GHz, 1x X3 @ 3.19GHz
-    std::vector<projecttenshin::arm64::CpuCoreInfo> sd8g2 = {
+    std::vector<projecttenshin::host::CpuCoreInfo> sd8g2 = {
         {0, 2016000, true}, {1, 2016000, true}, {2, 2016000, true},
         {3, 2803200, true}, {4, 2803200, true}, {5, 2803200, true}, {6, 2803200, true},
         {7, 3187200, true},
     };
-    auto t8g2 = projecttenshin::arm64::classify_topology(sd8g2);
+    auto t8g2 = projecttenshin::host::classify_topology(sd8g2);
     assert(t8g2.heterogeneous);
     assert(t8g2.prime_cores.size() == 1 && t8g2.prime_cores[0] == 7);
     assert(t8g2.gold_cores.size() == 5);
     assert(t8g2.silver_cores.size() == 3);
 
     // Homogeneous 4-core CPU
-    std::vector<projecttenshin::arm64::CpuCoreInfo> uniform = {
+    std::vector<projecttenshin::host::CpuCoreInfo> uniform = {
         {0, 1512000, true}, {1, 1512000, true}, {2, 1512000, true}, {3, 1512000, true},
     };
-    auto tuni = projecttenshin::arm64::classify_topology(uniform);
+    auto tuni = projecttenshin::host::classify_topology(uniform);
     assert(!tuni.heterogeneous);
     assert(tuni.prime_cores.size() == 4);
 }

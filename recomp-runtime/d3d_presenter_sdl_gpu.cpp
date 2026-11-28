@@ -7,7 +7,7 @@
 #include "d3d_texture_model.h"
 #include "d3d_vertex_program.h"
 #include "widescreen.h"
-#include "../platform/arm64/vulkan_freedreno.h"
+#include "../platform/linux/vulkan_freedreno.h"
 
 #include <SDL3/SDL.h>
 
@@ -2182,7 +2182,10 @@ static bool loadShadercSymbols() {
     if (!h) h = SDL_LoadObject("libshaderc_shared.so");
     if (!h) h = SDL_LoadObject("libshaderc.so.1");  // Debian and Ubuntu name
     if (!h) h = SDL_LoadObject("libshaderc.so");
+    // A package that ships its own copy, beside the runner: libs.aarch64 on a
+    // Snapdragon device, libs.x86_64 on an x86_64 handheld or desktop.
     if (!h) h = SDL_LoadObject("./libs.aarch64/libshaderc_shared.so.1");
+    if (!h) h = SDL_LoadObject("./libs.x86_64/libshaderc_shared.so.1");
 #endif
     if (!h) return false;
     s_shaderc_init = (ShadercCompilerInitFn)SDL_LoadFunction(h, "shaderc_compiler_initialize");
@@ -2222,7 +2225,9 @@ static std::vector<uint32_t> compileGlslToSpirv(const std::string &source, SDL_G
         std::fprintf(stderr, "[presenter] Vulkan shaders need shaderc.dll beside the runner\n");
 #else
         std::fprintf(stderr, "[presenter] Vulkan shaders need shaderc (libshaderc_shared.so.1, "
-                             "or libshaderc.so.1 from the libshaderc1 package)\n");
+                             "or libshaderc.so.1 from the libshaderc1 package; pacman -S shaderc "
+                             "on Arch, or bundle it in libs.x86_64/)");
+        std::fprintf(stderr, "\n");
 #endif
         return spv;
     }

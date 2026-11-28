@@ -66,7 +66,7 @@ DOA3 dynamically submits Xbox NV2A vertex programs and fixed-function FVF combin
 `doa3-re`'s SDL_GPU presenter includes a 24-step raymarched screen-space reflection water shader plus an extra single-sample depth pass on water stages. On **Adreno 740 / A32** (Snapdragon 8 Gen 2 / G3x Gen 2), this runs comfortably at 60 FPS. On **Adreno 630 / 650** (Snapdragon 845 / 865) at 2×–3× resolution, set `RECOMP_VK_SIMPLE_WATER=1` in `tenshin.env` to skip the extra depth pass and raymarch for locked 60 FPS.
 
 ### Snapdragon big.LITTLE Scheduling (`PROJECTTENSHIN_PIN_PERF`)
-`platform/arm64/thread_affinity.h` inspects `/sys/devices/system/cpu/online` and each core's `cpufreq/cpuinfo_max_freq` to separate Prime, Gold, and Silver clusters. Before SDL3/Vulkan initializes, the process mask is explicitly widened to all online cores so Mesa Freedreno/Turnip compiler and submission threads never get trapped on one CPU. When `PROJECTTENSHIN_PIN_PERF=1` (enabled by default in `run_arm64_vulkan.sh`), the Xbox guest thread runs on the Prime/Gold performance cluster while audio and driver workers stay free across all cores.
+`platform/linux/thread_affinity.h` inspects `/sys/devices/system/cpu/online` and each core's `cpufreq/cpuinfo_max_freq` to separate Prime, Gold, and Silver clusters. Before SDL3/Vulkan initializes, the process mask is explicitly widened to all online cores so Mesa Freedreno/Turnip compiler and submission threads never get trapped on one CPU. When `PROJECTTENSHIN_PIN_PERF=1` (enabled by default in `run_linux_vulkan.sh`, which `run_arm64_vulkan.sh` forwards to), the Xbox guest thread runs on the Prime/Gold performance cluster while audio and driver workers stay free across all cores.
 
 ---
 

@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// ProjectTenshin — Snapdragon big.LITTLE / Tri-Cluster Linux ARM64 thread affinity helper.
+// ProjectTenshin — Linux thread affinity helper for hybrid CPUs: Qualcomm
+// Snapdragon big.LITTLE / tri-cluster, and the P-core / E-core split of
+// Intel hybrid parts and AMD's dual-CCD or Zen 4c designs.
 //
 // Evolved from ProjectDural's thread_affinity.h for Qualcomm Snapdragon SoCs
 // (SD845, SD865/870, SD888, SD8 Gen 1/2/3, Snapdragon G3x Gen 2) running Linux
-// ARM64 (ROCKNIX, Arch ARM64, PostmarketOS, Debian, Ubuntu, PortMaster).
+// (ROCKNIX, Arch, PostmarketOS, Debian, Ubuntu, PortMaster), and generalized so
+// x86_64 handhelds (MSI Claw, ROG Ally, Legion Go) use the same classifier.
 //
 // Key principles learned from real handheld profiling:
 // 1. Always parse `/sys/devices/system/cpu/online` (sparse masks like "0,4-7"
 //    occur when power policies hot-unplug cores; naming an offline core makes
 //    pthread_setaffinity_np fail with EINVAL).
-// 2. On heterogeneous Snapdragon SoCs (Silver + Gold + Prime), classify cores by
-//    `cpufreq/cpuinfo_max_freq` so the latency-critical Xbox guest/fiber thread
-//    runs on the Prime/Gold performance cluster while SDL3, audio, and Mesa
-//    Freedreno/Turnip Vulkan worker threads stay free across all online CPUs.
+// 2. On a heterogeneous CPU (Snapdragon Silver + Gold + Prime, Intel P + E +
+//    LP-E), classify cores by `cpufreq/cpuinfo_max_freq` so the latency-critical
+//    Xbox guest/fiber thread runs on the fastest cluster while SDL3, audio and
+//    the Vulkan driver's worker threads stay free across all online CPUs.
 #pragma once
 
 #include <algorithm>
@@ -27,7 +30,7 @@
 #include <unistd.h>
 #endif
 
-namespace projecttenshin::arm64 {
+namespace projecttenshin::host {
 
 struct CpuCoreInfo {
     int id = 0;
@@ -198,15 +201,15 @@ inline bool set_current_thread_cpus(const std::vector<int> &cpus) {
 }
 
 // Allow the current thread (and any driver/audio/Vulkan worker threads it spawns)
-// to run on every online core so Mesa Freedreno/Turnip workers are never trapped
+// to run on every online core so the Vulkan driver's workers are never trapped
 // on a single CPU.
 inline bool unpin_current_thread_all_online() {
     return set_current_thread_cpus(read_online_cpus());
 }
 
-// Pin the guest execution thread to the Snapdragon Prime/Gold performance cluster
-// (only when heterogeneous clusters are detected, or if explicitly requested via
-// PROJECTTENSHIN_PIN_PERF=1). Never fails fatally.
+// Pin the guest execution thread to the fastest cluster (Snapdragon Prime/Gold,
+// or an x86_64 part's P-cores); only when heterogeneous clusters are detected.
+// Never fails fatally.
 inline bool pin_guest_thread_performance_cluster() {
     const char *env = std::getenv("PROJECTTENSHIN_PIN_PERF");
     if (env && std::strcmp(env, "0") == 0) {
@@ -221,7 +224,7 @@ inline bool pin_guest_thread_performance_cluster() {
     const bool ok = set_current_thread_cpus(target);
     if (ok) {
         std::fprintf(stderr,
-            "[ProjectTenshin] Snapdragon big.LITTLE detected (%zu online cores: %zu prime, %zu perf, %zu silver) -> guest pinned to perf cluster\n",
+            "[ProjectTenshin] heterogeneous CPU detected (%zu online cores: %zu prime, %zu perf, %zu silver) -> guest pinned to perf cluster\n",
             topo.cores.size(), topo.prime_cores.size(), target.size(), topo.silver_cores.size());
     }
     return ok;
@@ -235,4 +238,4 @@ inline void set_current_thread_name(const char *name) {
 #endif
 }
 
-} // namespace projecttenshin::arm64
+} // namespace projecttenshin::host

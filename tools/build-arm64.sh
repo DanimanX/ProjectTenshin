@@ -81,7 +81,7 @@ echo "[3/6] Cross-compiling ProjectTenshin runtime for $TARGET_TRIPLE ($TARGET_C
 
 COMMON_FLAGS="-target $TARGET_TRIPLE -mcpu=$TARGET_CPU -O2 -ffp-contract=off -fno-strict-aliasing -fwrapv \
   -D_GNU_SOURCE -DRECOMP_D3D_FRAME_ENABLED -DRECOMP_DSOUND_TEST_CLOCK -DRECOMP_DOAXBV_BINDINGS -DRECOMP_PUBLIC_LEAF_FIXTURE \
-  -Irecomp-runtime -Iplatform/arm64 -Ixbe -I$SDL3_INC -I$EXTERN/imgui"
+  -Irecomp-runtime -Iplatform/linux -Ixbe -I$SDL3_INC -I$EXTERN/imgui"
 
 RT_C_SRCS=(
     recomp-runtime/runtime.c
@@ -211,9 +211,9 @@ printf '%s\n' "${RT_CXX_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
 echo "[4/6] Cross-compiling Vulkan SDL_GPU presenter, Freedreno probe, and ARM64 launcher..."
 
 "$ZIG_BIN" c++ -std=c++17 -w $COMMON_FLAGS \
-    -c platform/arm64/tenshin_vk_probe.cpp -o "$BDIR/obj/tenshin_vk_probe.o"
+    -c platform/linux/tenshin_vk_probe.cpp -o "$BDIR/obj/tenshin_vk_probe.o"
 "$ZIG_BIN" c++ -std=c++17 -w $COMMON_FLAGS \
-    -c platform/arm64/freedreno_vulkan_test.cpp -o "$BDIR/obj/freedreno_vulkan_test.o"
+    -c platform/linux/freedreno_vulkan_test.cpp -o "$BDIR/obj/freedreno_vulkan_test.o"
 "$ZIG_BIN" c++ -std=c++17 -w $COMMON_FLAGS \
     -c tools/launcher_sdl.cpp -o "$BDIR/obj/launcher_sdl.o"
 

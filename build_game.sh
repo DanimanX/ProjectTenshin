@@ -9,6 +9,21 @@ if [[ "$(uname -s)" == Linux ]]; then
     if grep -qx 'ID=steamos' /etc/os-release 2>/dev/null; then
         exec "${SCRIPT_DIR}/build_steamdeck.sh" "$@"
     fi
+fi
+PYTHON="python3"
+VENV="${SCRIPT_DIR}/private/venv"
+# Debian, Ubuntu and Homebrew refuse a global pip install, so the build keeps its own Capstone.
+# Without the venv module the system python3 is used as before.
+if [[ ! -f "${VENV}/bin/python3" ]]; then
+    python3 -m venv "${VENV}" >/dev/null 2>&1 || rm -rf "${VENV}"
+fi
+if [[ -f "${VENV}/bin/python3" ]]; then
+    PYTHON="${VENV}/bin/python3"
+    # A cmake or ninja installed into the venv counts as present, which is how
+    # read-only distributions (SteamOS, Bazzite, CachyOS) build without sudo.
+    PATH="${VENV}/bin:${PATH}"
+fi
+if [[ "$(uname -s)" == Linux ]]; then
     # The tools this script and tools/build_game.py need.
     missing=()
     for tool in git cmake ninja; do
@@ -16,6 +31,24 @@ if [[ "$(uname -s)" == Linux ]]; then
     done
     { command -v c++ || command -v g++ || command -v clang++; } >/dev/null || missing+=("a C++ compiler")
     python3 -c "import ensurepip, venv" 2>/dev/null || missing+=("Python's venv")
+    if (( ${#missing[@]} )) && [[ "${PYTHON}" != python3 ]]; then
+        # CMake and Ninja are pip packages as well as distribution ones, so the
+        # build can supply them itself instead of asking for a root password.
+        pip_missing=()
+        for tool in cmake ninja; do
+            command -v "${tool}" >/dev/null || pip_missing+=("${tool}")
+        done
+        if (( ${#pip_missing[@]} )); then
+            echo "Installing ${pip_missing[*]} into private/venv..." >&2
+            "${PYTHON}" -m pip install --quiet --disable-pip-version-check "${pip_missing[@]}" >&2 || true
+            missing=()
+            for tool in git cmake ninja; do
+                command -v "${tool}" >/dev/null || missing+=("${tool}")
+            done
+            { command -v c++ || command -v g++ || command -v clang++; } >/dev/null || missing+=("a C++ compiler")
+            python3 -c "import ensurepip, venv" 2>/dev/null || missing+=("Python's venv")
+        fi
+    fi
     if (( ${#missing[@]} )); then
         echo "Missing build tools: ${missing[*]}." >&2
         if [[ ! -t 0 ]]; then
@@ -30,16 +63,6 @@ if [[ "$(uname -s)" == Linux ]]; then
         "${SCRIPT_DIR}/install_deps.sh" ||
             echo "Could not install bsdtar; the build skips the RAR costume pack." >&2
     fi
-fi
-PYTHON="python3"
-VENV="${SCRIPT_DIR}/private/venv"
-# Debian, Ubuntu and Homebrew refuse a global pip install, so the build keeps its own Capstone.
-# Without the venv module the system python3 is used as before.
-if [[ ! -f "${VENV}/bin/python3" ]]; then
-    python3 -m venv "${VENV}" >/dev/null 2>&1 || rm -rf "${VENV}"
-fi
-if [[ -f "${VENV}/bin/python3" ]]; then
-    PYTHON="${VENV}/bin/python3"
 fi
 # Distributions and Homebrew have no extract-xiso, so build the pinned release once.
 # Only an ISO needs it: a disc folder or a rebuild must still work offline.

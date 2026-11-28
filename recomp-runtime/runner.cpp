@@ -53,7 +53,7 @@
 #elif defined(__APPLE__)
 #include <pthread.h>
 #elif defined(__linux__)
-#include "../platform/arm64/thread_affinity.h"
+#include "../platform/linux/thread_affinity.h"
 #endif
 
 #ifdef RECOMP_FULL_PROGRAM
@@ -1108,13 +1108,13 @@ std::vector<AnalogPulse> inputAnalogPulses;
     bootConfig = {std::move(parsed), ram, ramWriteWatch, inputSource, deterministic,
         inputStartPulseEnabled};
 #if defined(__linux__)
-    // Ensure Mesa Freedreno/Turnip and SDL3 worker threads inherit all online CPUs;
-    // optionally pin the guest execution thread to Snapdragon's Prime/Gold cluster
-    // when PROJECTTENSHIN_PIN_PERF=1 is set.
-    projecttenshin::arm64::unpin_current_thread_all_online();
+    // Ensure the Vulkan driver and SDL3 worker threads inherit all online CPUs;
+    // optionally pin the guest execution thread to the fastest cluster (Snapdragon
+    // Prime/Gold, or a hybrid Intel/AMD part's P-cores) when PROJECTTENSHIN_PIN_PERF=1.
+    projecttenshin::host::unpin_current_thread_all_online();
     if (const char *pin_perf = std::getenv("PROJECTTENSHIN_PIN_PERF");
         pin_perf != nullptr && std::strcmp(pin_perf, "1") == 0) {
-        projecttenshin::arm64::pin_guest_thread_performance_cluster();
+        projecttenshin::host::pin_guest_thread_performance_cluster();
     }
 #endif
     bootGuest();

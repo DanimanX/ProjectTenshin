@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds and verifies the ROM-free Linux x86_64 / Vulkan runtime package:
+# the runtime self-tests, the Linux host-layer test, the Vulkan hardware probe
+# and the launcher script, plus the full Python tooling suite and the host
+# CTest run. On a tag it adds its archive to that tag's GitHub Release, which
+# the ARM64 workflow creates; both packages in one release is the point.
+#
+# Zero copyrighted game files or ROM-derived game code ever enter the build or artifacts.
+name: Build Linux x86_64 Vulkan
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install host build and Vulkan test dependencies
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update -q
+          sudo apt-get -o Acquire::Retries=3 install -qy --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 python3-venv \
+            libsdl3-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libsdl3-tests libxkbcommon-dev libwayland-dev \
+            wayland-protocols libdecor-0-dev libdrm-dev libgbm-dev libegl-dev libgl-dev \
+            libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libusb-1.0-0-dev \
+            libshaderc-dev libshaderc1 mesa-vulkan-drivers libvulkan1 \
+            libarchive-tools curl git file binutils
+        continue-on-error: true
+
+      - name: Install SDL3 when the distribution has no package for it
+        run: |
+          if pkg-config --exists sdl3; then
+            echo "system SDL3: $(pkg-config --modversion sdl3)"
+          else
+            echo "The distribution has no SDL3; CMake will build the pinned release."
+          fi
+
+      - name: Python tooling tests
+        run: python3 -m unittest discover -s tools -p "test_*.py"
+
+      - name: Public export verification
+        run: python3 tools/public_export.py verify --require-public-tree
+
+      - name: Build the x86_64 runtime, self-tests and probe, then run CTest
+        run: |
+          chmod +x tools/build-linux-x86_64.sh tools/build-host-test.sh run_linux_vulkan.sh
+          cmake -S recomp-runtime -B build/recomp-runtime -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DRECOMP_NETPLAY_VERSION="ci-${GITHUB_SHA::8}"
+          cmake --build build/recomp-runtime --parallel "$(nproc)"
+          SDL_VIDEO_DRIVER=offscreen ctest --test-dir build/recomp-runtime --output-on-failure
+
+      - name: Assemble the ROM-free x86_64 package
+        run: |
+          tools/build-linux-x86_64.sh
+          file dist/ProjectTenshin-Linux-x86_64-Vulkan/tenshin_*.x86_64
+          (cd dist && sha256sum ProjectTenshin-Linux-x86_64-Vulkan.tar.gz \
+            > ProjectTenshin-Linux-x86_64-Vulkan.tar.gz.sha256)
+          ls -lh dist/
+
+      - name: Upload Linux x86_64 Vulkan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectTenshin-Linux-x86_64-Vulkan
+          path: |
+            dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz
+            dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz.sha256
+
+      - name: Add the x86_64 package to the tag's release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          FILES="dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz.sha256"
+          cat > dist/notes-x86_64.md <<'EOF'
+
+          ### Linux x86_64 / Vulkan package
+
+          `ProjectTenshin-Linux-x86_64-Vulkan.tar.gz` holds the ROM-free x86_64 build: the runtime
+          self-test, the Linux host-layer test, the Vulkan hardware probe and `run_linux_vulkan.sh`.
+          It runs on Mesa Intel ANV, Mesa RADV (AMD) and any other conformant Vulkan 1.3 driver.
+
+          Build your own `doa3` runner from your own disc with `./build_game.sh /path/to/doa3.iso`,
+          then launch `./launcher.sh` (or `./run_game.sh`). To start it from Steam Game Mode, run
+          `./tools/steam_shortcut.py add --restart-steam` once, which adds the library entry Steam's
+          menu needs.
+          EOF
+          sed -i 's/^          //' dist/notes-x86_64.md
+          # The ARM64 workflow creates the release; wait for it, and create it only
+          # when that workflow did not run or failed before it got there.
+          for attempt in $(seq 1 60); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" $FILES --clobber
+              gh release view "$TAG" --json body --jq .body > dist/notes-existing.md
+              cat dist/notes-existing.md dist/notes-x86_64.md > dist/notes-merged.md
+              gh release edit "$TAG" --notes-file dist/notes-merged.md
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "No release for $TAG after 10 minutes; creating it with this package only." >&2
+          gh release create "$TAG" $FILES --title "ProjectTenshin $TAG (Linux x86_64 + ARM64, Vulkan)" \
+            --notes-file dist/notes-x86_64.md --latest

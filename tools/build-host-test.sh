@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Native host build and verification for ProjectTenshin:
+# Native host build and verification for ProjectTenshin on Linux (x86_64 or
+# ARM64) and macOS:
 #   1. Runs Python tooling & custody unit tests (tools/test_*.py)
-#   2. Configures and builds recomp-runtime + ProjectTenshin Freedreno/Snapdragon
+#   2. Configures and builds recomp-runtime + ProjectTenshin Linux host-layer
 #      tests + tenshin_vk_probe on the host
 #   3. Runs the full CTest suite (including SDL_GPU Vulkan presenter tests when
 #      Vulkan/Lavapipe + shaderc are present)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BDIR="$PWD/build-host-arm64"
-JOBS="${JOBS:-$(nproc)}"
+# One build folder per architecture, so an ARM64 and an x86_64 build of the same
+# checkout never overwrite each other.
+BDIR="$PWD/build-host-$(uname -m)"
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu)}"
 
 echo "[1/3] Running Python tooling tests..."
 python3 -m unittest discover -s tools -p 'test_*.py'
@@ -36,4 +39,4 @@ if [ -x "$BDIR/tenshin_vk_probe" ]; then
     "$BDIR/tenshin_vk_probe" --headless
 fi
 
-echo "All ProjectTenshin host verification checks passed."
+echo "All ProjectTenshin host verification checks passed ($(uname -m))."

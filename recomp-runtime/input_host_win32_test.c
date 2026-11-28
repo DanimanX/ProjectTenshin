@@ -139,6 +139,20 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < sizeof drivers / sizeof drivers[0]; ++i) SDL_SetHint(drivers[i], "0");
     CHECK(SDL_Init(SDL_INIT_GAMEPAD));
 
+    /* Ports are assigned in the order SDL reports pads, so this test only holds on
+       a machine with none attached: a handheld's built-in pad, Handheld Daemon's
+       translation of it, or Steam's virtual controller would take port 0 or 1
+       before the virtual pads below. Drivers the hints above cannot switch off
+       (Linux's udev one) are how those appear. */
+    int system_pads = 0;
+    SDL_JoystickID *system_ids = SDL_GetGamepads(&system_pads);
+    SDL_free(system_ids);
+    if (system_pads > 0) {
+        fprintf(stderr, "skip: %d gamepad(s) attached; this test needs none\n", system_pads);
+        SDL_Quit();
+        return 77;
+    }
+
     SDL_JoystickID first_id, second_id;
     SDL_Joystick *first = attach(0u, &first_id);
     CHECK(first != NULL);

@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.1.0 — 2026-11-28
+
+Linux **x86_64** is now a full target beside ARM64/Snapdragon, verified on an
+MSI Claw A1M (Intel Core Ultra 5 135H, Intel Arc iGPU, CachyOS, Steam Game Mode
+over gamescope). See
+[docs/release-notes/v1.1.0-linux-x86_64.md](docs/release-notes/v1.1.0-linux-x86_64.md)
+for what was measured and on which machine, and
+[docs/x86_64-linux.md](docs/x86_64-linux.md) for the build and run guide.
+
+### Added
+
+- **Linux x86_64 / Vulkan package** from `tools/build-linux-x86_64.sh`: the
+  runtime self-test, the Linux host-layer test, the Vulkan hardware probe and
+  `run_linux_vulkan.sh`, built natively with the host compiler.
+- **`run_linux_vulkan.sh`** for both Linux targets; it prefers the Freedreno /
+  Turnip ICD on aarch64, reports the available ICDs on x86_64, and applies the
+  shader cache, resolution scale and thread pinning on either.
+  `run_arm64_vulkan.sh` remains the ARM64 entry point and forwards to it.
+- **`tools/steam_shortcut.py`**, which registers the game in Steam's library so
+  Steam's Game Mode menu lists it, editing `shortcuts.vdf` with Steam's own key
+  spelling without disturbing existing shortcuts and refusing a file it cannot
+  parse. `--restart-steam` stops the session's supervising unit, writes the
+  entry and starts it again, because `steam -shutdown` alone comes back within a
+  second and reads the file before the entry exists.
+- **`docs/x86_64-linux.md`**: prerequisites by distribution, the build, the
+  Steam Game Mode shortcut, host verification and troubleshooting.
+- **CI** workflow `build-linux-x86_64.yml`: tooling tests, public-export
+  verification, full CMake build, the whole CTest suite, the x86_64 package, and
+  on a tag its archive attached to the release beside the ARM64 one.
+
+### Changed
+
+- `platform/arm64/` is now **`platform/linux/`** and its namespace
+  `projecttenshin::host`, because the CPU-cluster classifier and the Vulkan
+  helpers serve both architectures. The classifier reads
+  `cpufreq/cpuinfo_max_freq`, which describes a Snapdragon's Prime/Gold/Silver
+  tiers and an Intel hybrid part's P-cores/E-cores alike, so
+  `PROJECTTENSHIN_PIN_PERF=1` now pins the guest thread to the P-cores on x86_64.
+- `build_game.sh` finds `cmake` and `ninja` in `private/venv` and installs them
+  there when the system has neither, so a read-only distribution (SteamOS,
+  Bazzite, CachyOS) builds without a root password.
+- `tools/build-host-test.sh` builds for the host's architecture
+  (`build-host-$(uname -m)`) instead of assuming ARM64.
+- The presenter's shaderc fallback also searches `libs.x86_64/`.
+
 ## 1.0.0-arm64 — 2026-11-24
 
 The first tagged release of the Linux ARM64 / Vulkan port, verified on a

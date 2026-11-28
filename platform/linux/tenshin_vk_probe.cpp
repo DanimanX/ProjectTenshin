@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
 
     std::printf("=== ProjectTenshin ARM64 / Freedreno Vulkan Probe ===\n");
 
-    const auto topo = projecttenshin::arm64::detect_topology();
+    const auto topo = projecttenshin::host::detect_topology();
     std::printf("[cpu] online=%zu heterogeneous=%d prime=%zu perf=%zu silver=%zu\n",
         topo.cores.size(), topo.heterogeneous ? 1 : 0,
         topo.prime_cores.size(), topo.gold_cores.size(), topo.silver_cores.size());

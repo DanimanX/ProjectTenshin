@@ -95,11 +95,20 @@ Linux renders with Vulkan and compiles shaders at runtime with shaderc, so the
 host needs `libshaderc_shared.so.1` (SteamOS includes it) or, on Debian and
 Ubuntu, `libshaderc.so.1` from the `libshaderc1` package.
 
-Build in an x86-64 distribution with CMake, Ninja, a C++17 compiler, Git,
-Python 3.12 or newer with the `venv` module, SDL3's build dependencies, and
-`bsdtar` to unpack the RAR costume pack.
+Build in an x86-64 or ARM64 Linux distribution with CMake, Ninja, a C++17
+compiler, Git, Python 3.12 or newer with the `venv` module, SDL3's build
+dependencies, and `bsdtar` to unpack the RAR costume pack.
 `./install_deps.sh` installs them with apt, dnf or pacman (`--print` shows
-the commands instead). Then build:
+the commands instead). Where the system cannot install packages — SteamOS,
+Bazzite, CachyOS and other immutable images — put CMake and Ninja in the
+build's own virtual environment instead, which needs no root password:
+
+```bash
+python3 -m venv private/venv
+private/venv/bin/pip install cmake ninja capstone==5.0.7
+```
+
+Then build:
 
 ```bash
 ./install_deps.sh
@@ -132,9 +141,15 @@ from its GAME page, and `./build_game.sh` on SteamOS runs this script.
 `./run_game.sh` starts the game with the saved choices.
 
 For Steam Game Mode, add `launcher.sh` (or `run_game.sh`) with **Add a
-Non-Steam Game** in Desktop Mode. Under Steam the game and launcher open full
+Non-Steam Game** in Desktop Mode, or let
+`./tools/steam_shortcut.py add --restart-steam` do it: it writes the library
+entry into Steam's `shortcuts.vdf` and restarts Steam, which is what the Game
+Mode menu reads. Under Steam the game and launcher open full
 screen. If one controller drives two player ports, turn Steam Input off for
 that shortcut.
+
+On x86_64 Linux, `docs/x86_64-linux.md` covers the driver packages by
+distribution, the hybrid-CPU pinning and the same Steam shortcut in more detail.
 
 ## Differences from the Windows build
 

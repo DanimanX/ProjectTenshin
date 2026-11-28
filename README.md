@@ -1,17 +1,21 @@
 <p align="center">
-  <img src="assets/projecttenshin-banner.jpg" alt="ProjectTenshin — Dead or Alive 3++ Linux ARM64 Vulkan on Qualcomm Snapdragon with Mesa Freedreno/Turnip" width="100%">
+  <img src="assets/projecttenshin-banner.jpg" alt="ProjectTenshin — Dead or Alive 3++ Linux Vulkan port on ARM64 Snapdragon (Mesa Freedreno/Turnip) and x86_64 (Mesa ANV/RADV)" width="100%">
 </p>
 
-# ProjectTenshin — Dead or Alive 3++ Linux ARM64 / Vulkan Port (Snapdragon + Freedreno)
+# ProjectTenshin — Dead or Alive 3++ Linux / Vulkan Port (x86_64 + ARM64)
 
 [![Build ARM64 Vulkan](https://github.com/DanimanX/ProjectTenshin/actions/workflows/build-arm64.yml/badge.svg)](https://github.com/DanimanX/ProjectTenshin/actions/workflows/build-arm64.yml)
+[![Build Linux x86_64 Vulkan](https://github.com/DanimanX/ProjectTenshin/actions/workflows/build-linux-x86_64.yml/badge.svg)](https://github.com/DanimanX/ProjectTenshin/actions/workflows/build-linux-x86_64.yml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
-A native **Linux ARM64 (AArch64) & Vulkan** port of [NoRain211/doa3-re](https://github.com/NoRain211/doa3-re) (static recompilation of **Dead or Alive 3 / DOA3++** — Original Xbox), engineered specifically for **Qualcomm Snapdragon** Linux ARM64 devices running **Mesa Freedreno / Turnip** Vulkan (`libvulkan_freedreno.so`).
+A native **Linux & Vulkan** port of [NoRain211/doa3-re](https://github.com/NoRain211/doa3-re) (static recompilation of **Dead or Alive 3 / DOA3++** — Original Xbox) for two Linux targets:
 
-Inspired by the cross-compilation and platform-engineering structure of [ProjectDural](https://github.com/DanimanX/ProjectDural), **ProjectTenshin** pairs `doa3-re`'s static x86→C lifter (`xboxrecomp`) and native AArch64 fiber/runtime layer with a hermetic **Zig 0.17.0** `aarch64-linux-gnu.2.28` cross-build pipeline and dedicated **Snapdragon + Freedreno/Turnip** Vulkan optimizations.
+- **x86_64** handhelds, desktops and laptops through **Mesa Intel ANV** or **RADV (AMD)** — MSI Claw, ROG Ally, Legion Go, any Vulkan 1.3 machine. See [docs/x86_64-linux.md](docs/x86_64-linux.md).
+- **ARM64 (AArch64)** on **Qualcomm Snapdragon** Linux devices through **Mesa Freedreno / Turnip** (`libvulkan_freedreno.so`) — see [docs/snapdragon-freedreno.md](docs/snapdragon-freedreno.md).
 
-> **Bring Your Own Data (BYOD):** Zero copyrighted Xbox binaries, game assets, or ROM-derived compiled code are included in this repository or its releases. You must supply your own legally obtained *Dead or Alive 3* Xbox disc (Japan 3.1 recommended, USA 3.0, or Europe 3.2) and build your local `doa3.aarch64` runner using `tools/build-arm64-game.sh`.
+Inspired by the cross-compilation and platform-engineering structure of [ProjectDural](https://github.com/DanimanX/ProjectDural), **ProjectTenshin** pairs `doa3-re`'s static x86→C lifter (`xboxrecomp`) and native fiber/runtime layer with a **Zig 0.17.0** `aarch64-linux-gnu.2.28` cross-build pipeline for Snapdragon, a native host build for x86_64, and **Vulkan** optimizations for both (Freedreno/Turnip specifics on ARM64, hybrid-CPU thread pinning on x86_64).
+
+> **Bring Your Own Data (BYOD):** Zero copyrighted Xbox binaries, game assets, or ROM-derived compiled code are included in this repository or its releases. You must supply your own legally obtained *Dead or Alive 3* Xbox disc (Japan 3.1 recommended, USA 3.0, or Europe 3.2) and build your local runner with `./build_game.sh` (x86_64) or `tools/build-arm64-game.sh` (Snapdragon).
 >
 > *"Dead or Alive 3"* is a trademark of Koei Tecmo Games / Team Ninja. *"Snapdragon"* and *"Adreno"* are trademarks of Qualcomm Incorporated. This project is independent and not affiliated with any rights holder.
 
@@ -79,15 +83,35 @@ TARGET_CPU=cortex_x3 tools/build-arm64.sh
 
 This verifies every binary (`ARM aarch64`, max `GLIBC_2.28`, zero `libstdc++.so`) and outputs **`dist/ProjectTenshin-Linux-ARM64-Vulkan.tar.gz`**.
 
+The x86_64 package is built natively, with the host compiler, so run this on x86_64 Linux:
+
+```bash
+tools/build-linux-x86_64.sh
+```
+
+It outputs **`dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz`** holding the runtime self-test, the Linux host-layer test, the Vulkan probe and `run_linux_vulkan.sh`.
+
 ### 2. Run the Host Verification Suite (Zero Game Files Needed)
 
 ```bash
 tools/build-host-test.sh
 ```
 
-Runs all Python tooling tests, builds `recomp-runtime` + `projecttenshin-freedreno-vulkan` + `tenshin_vk_probe`, and executes the entire CTest suite (including the SDL3 GPU Vulkan presenter tests when Vulkan/Lavapipe and `libshaderc` are installed).
+Runs all Python tooling tests, builds `recomp-runtime` + `projecttenshin-freedreno-vulkan` + `tenshin_vk_probe`, and executes the entire CTest suite (including the SDL3 GPU Vulkan presenter tests when Vulkan/Lavapipe and `libshaderc` are installed). It builds for the host it runs on: x86_64 or ARM64.
 
-### 3. Build Your Own Legal DOA3 Runner for Snapdragon ARM64 (BYOD)
+### 3. Build Your Own Legal DOA3 Runner (BYOD)
+
+On **x86_64 Linux** (including SteamOS handhelds), from the extracted release archive or a clone:
+
+```bash
+git submodule update --init tools/xboxrecomp
+./build_game.sh /path/to/doa3.iso
+./launcher.sh            # settings screen, then the game
+```
+
+`./tools/steam_shortcut.py add --restart-steam` adds the library entry that Steam Game Mode's menu needs; see [docs/x86_64-linux.md](docs/x86_64-linux.md#4-steam-game-mode).
+
+On **Snapdragon ARM64**, cross-compile the game from an x86_64 host or build natively on the device:
 
 ```bash
 git submodule update --init tools/xboxrecomp

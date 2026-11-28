@@ -1033,6 +1033,10 @@ endif()
 if(TARGET recomp_input_host_test)
     target_compile_definitions(recomp_input_host_test PRIVATE RECOMP_INPUT_TEST)
     add_test(NAME recomp-runtime-input-host-sdl COMMAND recomp_input_host_test)
+    # The test drives the host input layer's own port assignment with virtual
+    # pads, which needs a machine with no gamepad attached: a handheld's pad or
+    # Steam's virtual controller would take the ports first.
+    set_tests_properties(recomp-runtime-input-host-sdl PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME recomp-runtime-input-host-keymap COMMAND recomp_input_host_test keymap)
     set_tests_properties(recomp-runtime-input-host-keymap PROPERTIES
         ENVIRONMENT "RECOMP_KEYMAP=a=20,bogus,start=74,x=53,ltrig=31;RECOMP_TEST_FOCUSED=1")
@@ -1207,12 +1211,13 @@ add_executable(recomp_netplay_profile_test netplay_profile_test.cpp)
 target_link_libraries(recomp_netplay_profile_test PRIVATE recomp_netplay)
 add_test(NAME recomp-runtime-netplay-profile COMMAND recomp_netplay_profile_test)
 
-# ProjectTenshin: Snapdragon big.LITTLE & Freedreno/Turnip Vulkan tests + probe
-add_executable(recomp_freedreno_vulkan_test ../platform/arm64/freedreno_vulkan_test.cpp)
-target_include_directories(recomp_freedreno_vulkan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform/arm64")
+# ProjectTenshin: Linux host layer (Snapdragon big.LITTLE clusters and Freedreno/
+# Turnip, or an x86_64 hybrid CPU and Mesa ANV/RADV) plus the Vulkan probe.
+add_executable(recomp_freedreno_vulkan_test ../platform/linux/freedreno_vulkan_test.cpp)
+target_include_directories(recomp_freedreno_vulkan_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform/linux")
 add_test(NAME projecttenshin-freedreno-vulkan COMMAND recomp_freedreno_vulkan_test)
 if(SDL3_FOUND)
-    add_executable(tenshin_vk_probe ../platform/arm64/tenshin_vk_probe.cpp)
-    target_include_directories(tenshin_vk_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform/arm64")
+    add_executable(tenshin_vk_probe ../platform/linux/tenshin_vk_probe.cpp)
+    target_include_directories(tenshin_vk_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../platform/linux")
     recomp_use_sdl3(tenshin_vk_probe)
 endif()
