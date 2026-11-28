@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// ProjectTenshin — ROM-free Snapdragon / Freedreno Vulkan hardware probe & self-test.
+// ProjectTenshin — ROM-free Linux / Vulkan hardware probe & self-test.
 //
-// Run on any Linux ARM64 Snapdragon device (or x86_64 Linux host with Vulkan/Lavapipe)
-// to verify before building a user-owned DOA3 disc:
-//   1. Snapdragon CPU cluster topology & online cores
-//   2. Mesa Freedreno / Turnip Vulkan ICD & SDL3 GPU Vulkan device creation
+// Run on any Linux machine — a Snapdragon ARM64 device with Mesa Freedreno /
+// Turnip, or an x86_64 handheld or desktop with Mesa ANV or RADV — to verify it
+// before building a user-owned DOA3 disc:
+//   1. CPU cluster topology (Snapdragon Prime/Gold/Silver, or a hybrid P/E split)
+//      and the online cores
+//   2. The Vulkan ICD in use and SDL3 GPU Vulkan device creation
 //   3. Hardware texture/depth format support (BC1/BC2/BC3, BGRA8, A8, D24S8, D32S8, D32F)
 //   4. MSAA 2x/4x/8x support & SPIR-V shader cache readiness
 #include "thread_affinity.h"
@@ -23,7 +25,11 @@ int main(int argc, char **argv) {
         if (std::strcmp(argv[i], "--headless") == 0) headless = true;
     }
 
-    std::printf("=== ProjectTenshin ARM64 / Freedreno Vulkan Probe ===\n");
+#if defined(__aarch64__) || defined(__arm64__)
+    std::printf("=== ProjectTenshin Linux / Vulkan Probe (ARM64) ===\n");
+#else
+    std::printf("=== ProjectTenshin Linux / Vulkan Probe (x86_64) ===\n");
+#endif
 
     const auto topo = projecttenshin::host::detect_topology();
     std::printf("[cpu] online=%zu heterogeneous=%d prime=%zu perf=%zu silver=%zu\n",

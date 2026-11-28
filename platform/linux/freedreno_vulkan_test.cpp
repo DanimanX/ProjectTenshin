@@ -109,6 +109,6 @@ int main() {
     test_snapdragon_cluster_classification();
     test_spirv_disk_cache();
     test_depth_preference();
-    std::printf("ProjectTenshin Freedreno/Snapdragon ARM64 tests passed.\n");
+    std::printf("ProjectTenshin Linux host-layer tests passed.\n");
     return 0;
 }
