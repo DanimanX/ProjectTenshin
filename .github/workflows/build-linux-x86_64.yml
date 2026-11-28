@@ -88,33 +88,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          # Only assets belong here. The release body is whatever
+          # docs/release-notes/$TAG.md says, which the ARM64 workflow publishes;
+          # appending to it from two workflows at once duplicates or loses text
+          # depending on which finishes last.
           FILES="dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz dist/ProjectTenshin-Linux-x86_64-Vulkan.tar.gz.sha256"
-          cat > dist/notes-x86_64.md <<'EOF'
-
-          ### Linux x86_64 / Vulkan package
-
-          `ProjectTenshin-Linux-x86_64-Vulkan.tar.gz` holds the ROM-free x86_64 build: the runtime
-          self-test, the Linux host-layer test, the Vulkan hardware probe and `run_linux_vulkan.sh`.
-          It runs on Mesa Intel ANV, Mesa RADV (AMD) and any other conformant Vulkan 1.3 driver.
-
-          Build your own `doa3` runner from your own disc with `./build_game.sh /path/to/doa3.iso`,
-          then launch `./launcher.sh` (or `./run_game.sh`). To start it from Steam Game Mode, run
-          `./tools/steam_shortcut.py add --restart-steam` once, which adds the library entry Steam's
-          menu needs.
-          EOF
-          sed -i 's/^          //' dist/notes-x86_64.md
+          NOTES="docs/release-notes/$TAG.md"
           # The ARM64 workflow creates the release; wait for it, and create it only
           # when that workflow did not run or failed before it got there.
           for attempt in $(seq 1 60); do
             if gh release view "$TAG" >/dev/null 2>&1; then
               gh release upload "$TAG" $FILES --clobber
-              gh release view "$TAG" --json body --jq .body > dist/notes-existing.md
-              cat dist/notes-existing.md dist/notes-x86_64.md > dist/notes-merged.md
-              gh release edit "$TAG" --notes-file dist/notes-merged.md
               exit 0
             fi
             sleep 10
           done
           echo "No release for $TAG after 10 minutes; creating it with this package only." >&2
-          gh release create "$TAG" $FILES --title "ProjectTenshin $TAG (Linux x86_64 + ARM64, Vulkan)" \
-            --notes-file dist/notes-x86_64.md --latest
+          if [ -f "$NOTES" ]; then
+            gh release create "$TAG" $FILES \
+              --title "ProjectTenshin $TAG (Linux x86_64 + ARM64, Vulkan)" \
+              --notes-file "$NOTES" --latest
+          else
+            gh release create "$TAG" $FILES \
+              --title "ProjectTenshin $TAG (Linux x86_64 + ARM64, Vulkan)" \
+              --generate-notes --latest
+          fi
